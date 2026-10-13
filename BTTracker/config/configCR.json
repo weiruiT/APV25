@@ -1,0 +1,33 @@
+{
+  "run": {
+    "normalize_decoded_root": "True",
+    "analysis_apv": "True",
+    "decode_apv": "True",
+    "reconstruct_track": "True",
+    "pad_reconstruction": "True",
+
+    "noise_analysis": "True",
+    "amplitude_distribution": "False",
+    "energy_spectrum": "False",
+    "arrival_time_comparison": "False"
+  },
+  "detector_layout": {
+    "bm1_enabled": true,
+    "bm2_enabled": true
+  },
+  "signal_cuts": {
+    "amplitude_min": 0.0,
+    "max_t_min": 0.0,
+    "max_t_max": 15.0,
+    "rise_time_min": 0.0,
+    "rise_time_max": 10.0,
+    "tot_min": 2.0,
+    "tot_max": 14.0,
+    "peak_threshold_sigma": 5.0,
+    "require_single_peak": true,
+    "require_valid_sigmoid": true
+  },
+  "timing_cuts": {
+    "bm2_matched_pad_count": 1
+  }
+}
