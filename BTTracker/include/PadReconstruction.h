@@ -14,6 +14,10 @@
 // trXY{A,E,S}_{mean,min,n}[layer] pool the matched X/Y strips of ONE
 // detector (physical Tracker2 = index 1). ev* retain their legacy meaning
 // of ALL three layers pooled. Stored times are in 25 ns sample units.
+// BM event trees additionally retain cluster membership and per-cluster t20.
+// TrackArrivalEvents.bmClusterS_* use all valid pads of a unique spatially
+// matched cluster; bm_matched_cluster_count counts all spatial candidates.
+// The existing bmS_* 3x3 pad timing is unchanged.
 bool ReconstructPadEvents(TString step2Name, TString step4Name,
                           TString outputName, bool bm1Enabled = true,
                           bool bm2Enabled = true);

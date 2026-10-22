@@ -34,11 +34,22 @@
   "timing_cuts": {
     "bm2_matched_pad_count": 1,
     "detectors": ["BM1", "BM2", "Tracker1", "Tracker2", "Tracker3"]
+  },
+  "cluster_timing": {
+    "enabled": true
+  },
+  "snr_timing": {
+    "enabled": true,
+    "bin_edges": [10, 30, 50, 70, 90, 120]
   }
 }
 ```
 
 字符串 `"True"`/`"False"` 和 JSON 布尔值都可识别。
+
+上例显式列出了 `timing_cuts.detectors` 的默认参与探测器；公共 JSON 可以省略该键。
+SNR 的公共默认值、run 覆盖优先级及独立脚本的参数见
+[SNR 配置说明](../../docs/BM_SNR_TIMING_DIAGNOSTICS.md#分组配置的来源)。
 
 `signal_cuts` 在 step2 统一生效，数值范围使用开区间。step3 不会重复做这些波形 cut。`peak_threshold_sigma` 控制显著峰候选的最低高度：`峰值 > peak_threshold_sigma × 本 run 对应 global_channel 的 noise sigma`。默认值为 5；noise pedestal mean 不参与信号基线扣除。实际生效值同时写入 `Tracker-step2-ana.root` 的 `WaveformSelection` 和 `PeakSelectionNoiseCalibration` 元数据。
 
@@ -76,4 +87,15 @@
 
 signal 的输入已预处理，仍保持 `pedestal=0`，不再次做基线扣除或通道 3σ 筛选；但 Step2 显著峰判定会读取本 run 的 `Combine/noise/noise-global-parameters-1778.txt`，仅使用其中的 sigma。noise mode 从 `Tracker/noise/` 读取原始波形，并把 1778 通道标定写到 `Combine/noise/`。因此首次处理应使用 `--mode all`，或先运行 noise 再运行 signal。
 
-`timing_cuts.bm2_matched_pad_count` 控制 signal 结束后自动执行的时间分辨分析。默认值 `1` 要求 `TrackArrivalEvents.bmS_n[1] == 1`；这里统计的是径迹预测点周围 3×3 匹配窗口内、具有有效 sigmoid t20 的 BM2 唯一 pad 数，不是整块 BM2 平面上的原始过阈通道数。设为 `0` 可关闭该多重性 cut。该条件作用于整套时间差样本，使 BM2–Tracker 和用于方差联合解的 Tracker–Tracker 对使用同一个单 pad 事例集合。`timing_cuts.detectors` 默认包含 BM1、BM2 和三层 Tracker；缺少某个探测器数据时，应在 run 覆盖中只列出实际参与联合解的探测器。
+`timing_cuts.bm2_matched_pad_count` 控制 signal 结束后自动执行的时间分辨分析。默认值 `1` 要求 `TrackArrivalEvents.bmS_n[1] == 1`；这里统计的是径迹预测点周围 3×3 匹配窗口内、具有有效 sigmoid 拟合的 BM2 唯一 pad 数，不是整块 BM2 平面上的原始过阈通道数。一次 sigmoid 拟合同时产生 t20、t30、t40、t50，四种结果沿用同一事件选择和方差解流程。设为 `0` 可关闭该多重性 cut。该条件先筛选整套时间差样本；随后每对再要求双方时间有效，因此 BM2–Tracker 与 Tracker–Tracker 对的实际事件集合可以不同。`timing_cuts.detectors` 默认包含 BM1、BM2 和三层 Tracker；缺少某个探测器数据时，应在 run 覆盖中只列出实际参与联合解的探测器。
+
+这些配置没有启用 BM2 矩形位置 cut；独立的 ROI 分析和其他绘图条件见
+[分析样本与 cut 对照](../../docs/ANALYSIS_SELECTIONS.md)。
+
+`cluster_timing.enabled`（布尔值，公共配置默认 `true`）额外启用基于聚类的时间分辨分析，
+不替代上述单 pad 模式。选取 BM2 唯一一个与径迹 3×3 pad 窗口相交的空间 cluster，
+要求至少一个成员具有有效 sigmoid 拟合；使用完整 cluster 内有效 pad 的等权平均/最早时间，
+不限制 cluster 的 pad 数。多个空间候选即使仅一个有有效时间也不选取。此模式沿用
+`timing_cuts.detectors` 和现有 Tracker 时间定义，独立输出到
+`Combine/time_resolution/cluster/<execution_id>/`，记录 `cluster_timing.log`、manifest
+及 `metadata/latest_cluster_timing.json`。设为 `false` 可只运行原有模式。

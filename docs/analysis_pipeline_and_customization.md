@@ -62,7 +62,9 @@ Tracker 通道通过 `config/map_APV.txt` 映射到 0–255 strip；BM 通道通
 - `riseT`：20% 到 80% 上升时间；
 - `TOT`：50% 上升交点到 50% 下降交点，即离散波形的 FWHM 近似；
 - `arrivalT_sigmoid`/`sigmoid_t20`：上升沿 sigmoid 拟合得到的 20% 时间；
-- `sigmoid_t50/B/H/k/status/chi2/start/end`：拟合参数和质量；
+- `arrivalT_sigmoid30/40/50`：复用同一次 sigmoid 拟合参数计算的 30%、40%、50% 交点；
+- `sigmoid_t50/B/H/k/status/chi2/start/end`：拟合参数和质量，其中 `sigmoid_t50` 是拟合参数，
+  `arrivalT_sigmoid50` 是对应的 50% 恒比到时（在当前函数定义下两者数值相同）；
 - `peak_noise_rms`、`peak_threshold_adc`：本通道噪声 sigma 和实际显著峰 ADC 阈值；
 - `n_significant_peaks`、`wave`、`timestamp`：峰数诊断、原波形和时间戳。
 
@@ -159,30 +161,63 @@ BM2Events->Draw("primary_charge", "primary_charge>0");
 
 这是未做能量标定的积分信号谱。两棵 BM 事件树使用各自全部入选 pad，不施加径迹匹配；径迹匹配时间保存在下面的 `TrackArrivalEvents` 中。
 
-`TrackArrivalEvents` 只写 `useflag=true` 的径迹：
+`TrackArrivalEvents` 只写 `useflag=true` 的径迹。后缀 `S`、`S30`、`S40`、`S50`
+分别代表 sigmoid t20/t30/t40/t50；时间仍以 APV 采样点存储：
 
-- BM：取径迹投影 pad 周围 3×3 窗口；`bmS_mean/min/n[2]` 是两块 BM 的 sigmoid t20；
-- Tracker：在预测 strip ±2 范围内按 gap≤1 聚类；`trS_*[3][2]` 是三层 X/Y 时间；
-- `evS_mean/min/n` 是所有选中 Tracker strip 合并后的 event 参考时间；
+- BM：取径迹投影 pad 周围 3×3 窗口；`bmS*_{mean,min,n}[2]` 是两块 BM 的各恒比时间；
+- Tracker：在预测 strip ±2 范围内按 gap≤1 聚类；`trS*_*[3][2]` 是三层 X/Y 时间；
+- `evS*_{mean,min,n}` 是所有选中 Tracker strip 合并后的 event 参考时间；
 - A/E 是已停用 Pause 拟合的兼容分支，当前应使用后缀 `S` 的 sigmoid 量。
 
 ### 3.6 自动时间分辨与 BM2−Tracker 高斯图
 
 每次成功的 signal 链在 PadReconstruction 后自动运行
-`scripts/analyze_time_resolution.py`。BM2 事件时间是径迹中心 3×3 pad 窗口内
-有效 sigmoid t20 的算术平均；每层 Tracker 时间是预测 strip ±2 范围内匹配 cluster
-的有效 X/Y strip t20 按 strip 数合并后的平均。每一探测器对使用自己的共同有效事例，
-时间差定义为 `Δt=t_first-t_second`，并乘 25 ns/sample。
+`scripts/analyze_time_resolution.py`。它对 t20/t30/t40/t50 分别完成完整时间分辨分析。
+四个恒比时间由同一条波形的一次 sigmoid 拟合得到，不会重复拟合；样本选择与拟合有效性
+保持一致。BM2 事件时间是径迹中心 3×3 pad 窗口内有效 pad 时间的算术平均；每层 Tracker
+时间是预测 strip ±2 范围内匹配 cluster 的有效 X/Y strip 时间按 strip 数合并后的平均。
+对 sigmoid `B + H/(1 + exp(-(t-t50)/k))`，比例 `f` 的到时为
+`t_f = t50 + k·ln(f/(1-f))`；其中 `f=0.3/0.4` 计算 t30/t40，t50 就是拟合参数 `t50`。
+每一探测器对使用自己的共同有效事例，时间差定义为 `Δt=t_first-t_second`，并乘
+25 ns/sample。
 
-默认主流程在构造所有时间差样本前先要求 `bmS_n[1] == timing_cuts.bm2_matched_pad_count`；当前默认值为 1，即 BM2 在径迹中心 3×3 窗口内恰好一个具有有效 sigmoid t20 的唯一 pad。这是匹配窗口的有效时间 pad 多重性，不是整块 BM2 的原始过阈通道多重性。设为 0 关闭此 cut。cut 在时间分析阶段统一筛选整个事例，因此 BM2–Tracker 与 Tracker–Tracker 分布来自同一单 pad 事例集合，不会删除 step2/step3 中间 ROOT 里的多 pad 信息。
+默认主流程在构造所有时间差样本前先要求 `bmS_n[1] == timing_cuts.bm2_matched_pad_count`；当前默认值为 1，即 BM2 在径迹中心 3×3 窗口内恰好一个具有有效 sigmoid 拟合的唯一 pad。这是匹配窗口的有效时间 pad 多重性，不是整块 BM2 的原始过阈通道多重性。设为 0 关闭此 cut。一次成功拟合会产生四种 CFD 时间，因此该 cut 在 t20/t30/t40/t50 分析间使用同一组事例，不会删除 step2/step3 中间 ROOT 里的多 pad 信息。
+
+主流程没有额外施加 `x∈[-10,40]、y∈[-40,10] mm` 的 BM2 预测位置 cut，也不强制
+三层 Tracker 的 X/Y 六个方向全部有空间响应。各对还会分别筛选双方有效时间，因此它们
+最终的事例数可以不同。角度图、cluster 分布和独立位置 cut 分析的区别见
+[分析样本与 cut 对照](ANALYSIS_SELECTIONS.md)。
 
 两两分布先用 median/MAD 初始化并迭代做 3σ 核心选择；直方图显示核心中心 ±6σ，
-高斯在核心中心 ±3σ 内拟合。正式输出位于 `Combine/time_resolution/`，包括
+高斯在核心中心 ±3σ 内拟合。计算与诊断工作输出位于 `Combine/time_resolution/`，包括
 BM2−Tracker1/2/3 的单图和合并图、`bm2_tracker_gaussian_fits.tsv`、
 `bm2_tracker_time_differences.root`，以及两两方差联合求解的
 `pairwise_time_resolution.tsv`、`detector_time_resolution.tsv` 和
-`time_resolution.json`。这些文件属于 signal 必需输出，写入 execution manifest，
-导出时进入 `Results/<tag>/timing/time_resolution/`。
+`time_resolution.json`。t20 仍在目录根部保持旧文件名；t30/t40/t50 的同类图表位于
+各自子目录。`cfd_fraction_resolution.tsv/.png/.pdf` 汇总四种比例的逐探测器时间分辨。
+这些文件属于 signal 必需输出，写入 execution manifest。
+本次所有请求阶段成功后，数值结果与 CFD 汇总图自动进入
+`Results/<execution_id>/timing/time_resolution/`；时间差分布 ROOT/图像、
+高斯拟合图和参数表继续保存在 Combine。手动导出可使用自定义 tag。
+
+正式时间分析完成后，run manager 还会根据 `snr_timing.enabled`（默认 `true`）调用
+`BTTracker/scripts/analyze_bm_snr_timing.py`，随后调用
+`BTTracker/scripts/export_bm_snr_intermediates.py`。`snr_timing.bin_edges` 由公共配置与
+run 覆盖合成，当前公共边界及独立运行规则见 [SNR 配置说明](BM_SNR_TIMING_DIAGNOSTICS.md#分组配置的来源)。
+相邻边界形成左闭右开区间。SNR 定义为匹配 BM2 波形的
+`maxA / peak_noise_rms`；事件要求 BM2 预测点 3×3 窗口内恰有一个有效时间 pad，
+以便把该事件的 SNR 唯一关联到时间样本。该诊断使用 BM2、Tracker1、Tracker2、Tracker3
+四个探测器求解，不修改正式时间分析或 Step2 的 selection。每个区间少于 40 个匹配事件时，
+该区间保留状态与事件表，但不计算分辨；其他区间仍继续。
+
+输出位于 `Combine/time_resolution/snr_binned/<execution_id>/`。`snr_bins.tsv` 和
+`snr_timing_report.json` 给出分组结果；`pairwise_details/README.md` 链接各区间的六组
+时间差图。每组另保存原始/核心分布、迭代 3σ 筛选记录、诊断高斯拟合、逐事件时间差、
+方差方程和矩阵解。新增图中的高斯拟合仅作诊断；BM2 分辨依旧由生产算法使用的核心样本
+标准差及六组 pairwise 方差方程得到。整个目录作为独立 `snr_timing` stage 写入 manifest，
+发布时仅分组数值表、`snr_timing_report.json`、`snr_threshold_scan.png/pdf` 和
+各组 `detector_solution.tsv` 进入 Results；后者归到 `detector_solutions/`。
+`pairwise_details/` 的事件、分布、迭代记录及矩阵解保留在 Combine。
 
 TSV 中 `gaussian_mu_error_ns` 和 `gaussian_sigma_error_ns` 是 ROOT 最小化器在最优点
 由拟合参数协方差矩阵对角元开方得到的条件统计误差；应同时检查

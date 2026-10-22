@@ -4,12 +4,17 @@ Run after sourcing thisroot.sh: /usr/bin/python3 -m unittest discover
     -s BTTracker/tests -p test_pad_reconstruction.py
 """
 from array import array
+import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
 
 import ROOT
 
+timing_spec = importlib.util.spec_from_file_location(
+    "pad_timing_analysis", Path(__file__).resolve().parents[1] / "scripts/analyze_time_resolution.py")
+timing_analysis = importlib.util.module_from_spec(timing_spec)
+timing_spec.loader.exec_module(timing_analysis)
 
 class PadReconstructionTests(unittest.TestCase):
     @classmethod
@@ -32,14 +37,16 @@ class PadReconstructionTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def make_inputs(self, with_chip=True):
+    def make_inputs(self, with_chip=True, extra_signals=(), track_x=0.0):
         with ROOT.TFile(str(self.step2), "RECREATE") as source:
             tree = ROOT.TTree("BMPadSignals", "Selected BM waveforms")
             integers = {name: array("i", [0]) for name in
                         ("event", "channel", "global_channel", "position", "raw_chip")}
             doubles = {name: array("d", [0.0]) for name in
                        ("ped", "pedrms", "maxA", "arrivalT", "arrivetime_a",
-                        "arrivetime_e", "arrivetime_sigmoid")}
+                        "arrivetime_e", "arrivetime_sigmoid",
+                        "arrivalT_sigmoid30", "arrivalT_sigmoid40",
+                        "arrivalT_sigmoid50")}
             timestamp = array("q", [0])
             wave = ROOT.std.vector("short")()
             for name, value in integers.items():
@@ -60,6 +67,11 @@ class PadReconstructionTests(unittest.TestCase):
                 for name, value in zip(("arrivalT", "arrivetime_a", "arrivetime_e",
                                         "arrivetime_sigmoid"), time):
                     doubles[name][0] = value
+                for name, offset in (("arrivalT_sigmoid30", 1.0),
+                                     ("arrivalT_sigmoid40", 2.0),
+                                     ("arrivalT_sigmoid50", 3.0)):
+                    base = time[3]
+                    doubles[name][0] = base + offset if base > -900 else base
                 timestamp[0] = stamp
                 wave.clear()
                 for sample in samples:
@@ -83,17 +95,33 @@ class PadReconstructionTests(unittest.TestCase):
             # a BM tree row, even if the event has a valid track.
             signal(4, 12, -1, [0, 100], [1, 1, 1, 1], 400)
             signal(4, 13, 60, [0, 5], [1, 1, 1, 1], 400)
+            for row in extra_signals:
+                signal(*row)
             tree.Write()
 
             # Empty tracker trees still exercise the full pad function.
-            status = array("i", [0])
+            pulse_status = array("i", [-1])
+            sigmoid_status = array("i", [0])
+            strip_event = array("i", [0])
+            strip_channel = array("i", [128])
+            strip_times = {name: array("d", [-999.0]) for name in
+                           ("arrivalT", "arrivalT_e", "arrivalT_sigmoid",
+                            "arrivalT_sigmoid30", "arrivalT_sigmoid40",
+                            "arrivalT_sigmoid50")}
             for layer in range(3):
                 for direction in "XY":
                     strip = ROOT.TTree(f"Track{direction}{layer}", "Tracker signals")
-                    for name in ("event", "channel"):
-                        strip.Branch(name, integers[name], f"{name}/I")
-                    strip.Branch("arrivalT", doubles["arrivalT"], "arrivalT/D")
-                    strip.Branch("pulseFitStatus", status, "pulseFitStatus/I")
+                    strip.Branch("event", strip_event, "event/I")
+                    strip.Branch("channel", strip_channel, "channel/I")
+                    for name, value in strip_times.items():
+                        strip.Branch(name, value, f"{name}/D")
+                    strip.Branch("pulseFitStatus", pulse_status, "pulseFitStatus/I")
+                    strip.Branch("sigmoidFitStatus", sigmoid_status, "sigmoidFitStatus/I")
+                    if layer == 0 and direction == "X":
+                        strip_event[0] = 1
+                        for name, value in zip(strip_times, (23, 24, 25, 26, 27, 28)):
+                            strip_times[name][0] = value
+                        strip.Fill()
                     strip.Write()
             source.Write()
 
@@ -107,8 +135,9 @@ class PadReconstructionTests(unittest.TestCase):
             track.Branch("event", event, "event/I")
             track.Branch("timestamp", timestamp, "timestamp/L")
             track.Branch("useflag", useflag, "useflag/O")
-            for name in ("XfitPars", "YfitPars"):
-                track.Branch(name, fit, f"{name}[3]/D")
+            xfit = array("d", [0.0, track_x, 0.0])
+            track.Branch("XfitPars", xfit, "XfitPars[3]/D")
+            track.Branch("YfitPars", fit, "YfitPars[3]/D")
             for name in ("predStripX", "predStripY"):
                 track.Branch(name, prediction, f"{name}[3]/D")
             for number in range(1, 5):
@@ -150,6 +179,12 @@ class PadReconstructionTests(unittest.TestCase):
             self.assertEqual((bm1.arrivalT_sigmoid_min, bm2.arrivalT_sigmoid_min),
                              (12, 52))
             self.assertEqual((bm1.n_arrivalT_sigmoid, bm2.n_arrivalT_sigmoid), (3, 2))
+            self.assertEqual((bm1.arrivalT_sigmoid30_mean,
+                              bm2.arrivalT_sigmoid30_mean), (17, 55))
+            self.assertEqual((bm1.arrivalT_sigmoid40_mean,
+                              bm2.arrivalT_sigmoid40_mean), (18, 56))
+            self.assertEqual((bm1.arrivalT_sigmoid50_mean,
+                              bm2.arrivalT_sigmoid50_mean), (19, 57))
             self.assertEqual(bm1.arrivetime_mean, bm1.arrivalT_a_mean)
             bm1.GetEntry(1)
             self.assertEqual(bm1.event, 2)
@@ -167,8 +202,83 @@ class PadReconstructionTests(unittest.TestCase):
             times.GetEntry(0)
             self.assertEqual(list(times.bmS_n), [2, 2])
             self.assertEqual(list(times.bmS_mean), [14, 54])
+            self.assertEqual(list(times.bmS30_mean), [15, 55])
+            self.assertEqual(list(times.bmS40_mean), [16, 56])
+            self.assertEqual(list(times.bmS50_mean), [17, 57])
+            self.assertEqual(times.trS_mean[0][0], 25)
+            self.assertEqual(times.trS30_mean[0][0], 26)
+            self.assertEqual(times.trS40_mean[0][0], 27)
+            self.assertEqual(times.trS50_mean[0][0], 28)
+            self.assertEqual(list(times.bmClusterS_mean), [14, 54])
+            self.assertEqual(list(times.bmClusterS30_mean), [15, 55])
+            self.assertEqual(list(times.bmClusterS_n), [2, 2])
+            self.assertEqual(list(times.bm_matched_cluster_count), [1, 1])
             self.assertEqual(list(times.bm_pred_ix), [5, 5])
             self.assertEqual(times.evS_n, 0)
+
+    def test_cluster_time_includes_whole_cluster_and_excludes_other_clusters(self):
+        self.make_inputs(extra_signals=(
+            (1, 13, 82, [0, 30], [70] * 4, 110),
+            (1, 13, 93, [0, 40], [80] * 4, 120),
+            (1, 13, 0, [0, 500], [200] * 4, 130),
+        ))
+        self.assertTrue(ROOT.ReconstructPadEvents(str(self.step2), str(self.step4), str(self.output)))
+        with ROOT.TFile(str(self.output), "READ") as source:
+            bm2 = source.Get("BM2Events")
+            bm2.GetEntry(0)
+            self.assertEqual(list(bm2.hit_cluster_index), [0, 1, 1, 1, 1])
+            self.assertEqual(list(bm2.cluster_size), [1, 4])
+            self.assertEqual(list(bm2.cluster_time_sigmoid_n), [1, 4])
+            self.assertEqual(list(bm2.cluster_time_sigmoid_mean), [200, 64.5])
+            self.assertEqual(list(bm2.cluster_time_sigmoid30_mean), [201, 65.5])
+            times = source.Get("TrackArrivalEvents")
+            times.GetEntry(0)
+            self.assertEqual(times.bmS_n[1], 2)
+            self.assertEqual(times.bmS_mean[1], 54)  # legacy window unchanged
+            self.assertEqual(times.bm_matched_cluster_count[1], 1)
+            self.assertEqual(times.bm_matched_cluster_index[1], 1)
+            self.assertEqual(times.bm_matched_cluster_size[1], 4)
+            self.assertEqual(times.bmClusterS_n[1], 4)
+            self.assertEqual(times.bmClusterS_mean[1], 64.5)
+            self.assertEqual(times.bmClusterS30_mean[1], 65.5)
+            self.assertEqual(times.bmClusterS_min[1], 52)
+        cluster, _, total = timing_analysis.read_events(self.output, 0, "cluster")
+        legacy, _, _ = timing_analysis.read_events(self.output, 1)
+        self.assertEqual(total, 3)
+        self.assertEqual([row["event"] for row in cluster], [1])
+        self.assertEqual(cluster[0]["mean"][1], 64.5 * 25)
+        self.assertNotIn(1, [row["event"] for row in legacy])
+        with self.assertRaises(ValueError):
+            timing_analysis.read_events(self.output, 1, "cluster")
+
+    def test_ambiguous_spatial_clusters_are_rejected_even_with_one_valid_time(self):
+        self.make_inputs(extra_signals=(
+            (3, 13, 49, [0, 30], [20] * 4, 310),
+            (3, 13, 61, [0, 40], [-999] * 4, 320),
+        ))
+        self.assertTrue(ROOT.ReconstructPadEvents(str(self.step2), str(self.step4), str(self.output)))
+        with ROOT.TFile(str(self.output), "READ") as source:
+            times = source.Get("TrackArrivalEvents")
+            times.GetEntry(1)
+            self.assertEqual(times.event, 3)
+            self.assertEqual(times.bmS_n[1], 1)
+            self.assertEqual(times.bm_matched_cluster_count[1], 2)
+            self.assertEqual(times.bm_matched_cluster_index[1], -1)
+            self.assertEqual(times.bmClusterS_n[1], 0)
+            self.assertEqual(times.bmClusterS_mean[1], -999)
+        cluster, _, _ = timing_analysis.read_events(self.output, 0, "cluster")
+        legacy, _, _ = timing_analysis.read_events(self.output, 1)
+        self.assertNotIn(3, [row["event"] for row in cluster])
+        self.assertIn(3, [row["event"] for row in legacy])
+
+    def test_prediction_outside_pad_plane_has_no_cluster_time(self):
+        self.make_inputs(track_x=100.0)
+        self.assertTrue(ROOT.ReconstructPadEvents(str(self.step2), str(self.step4), str(self.output)))
+        with ROOT.TFile(str(self.output), "READ") as source:
+            for row in source.Get("TrackArrivalEvents"):
+                self.assertEqual(list(row.bm_matched_cluster_count), [0, 0])
+                self.assertEqual(list(row.bmClusterS_n), [0, 0])
+                self.assertEqual(list(row.bmClusterS_mean), [-999, -999])
 
     def test_disabled_bm_has_zero_tree_and_branch_entries(self):
         self.make_inputs()
@@ -184,6 +294,8 @@ class PadReconstructionTests(unittest.TestCase):
             for row in source.Get("TrackArrivalEvents"):
                 self.assertEqual(row.bmS_n[0], 0)
                 self.assertEqual(row.bmS_mean[0], -999)
+                self.assertEqual(row.bm_matched_cluster_count[0], 0)
+                self.assertEqual(row.bmClusterS_n[0], 0)
             self.assertIn("BM1 enabled=0; BM2 enabled=1",
                           source.Get("BMPadDetectorSelection").GetTitle())
 

@@ -27,3 +27,4 @@
 !/docs/**/*.md
 !/batches/README.md
 !/batches/run_template/**/.gitkeep
+/batches/run_status.tsv

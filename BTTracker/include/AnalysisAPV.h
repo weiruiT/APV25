@@ -101,6 +101,9 @@ class AnalysisAPV
     double arrivalT_a;
     double arrivalT_e;
     double arrivalT_sigmoid;
+    double arrivalT_sigmoid30;
+    double arrivalT_sigmoid40;
+    double arrivalT_sigmoid50;
     double sigmoidT50;
     double sigmoidBaseline;
     double sigmoidHeight;

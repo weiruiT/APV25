@@ -27,7 +27,7 @@ run_001/
 ├── Combine/               # step1–step4、Pad
 │   └── noise/             # 1778 通道噪声标定和 QA
 ├── metadata/              # 执行清单、日志、配置快照、哈希
-└── Results/               # 正式不可覆盖结果
+└── Results/               # 自动归档的最终时间分辨结果（不可覆盖）
 ```
 
 ## 运行
@@ -55,12 +55,58 @@ run_001/
 ```
 
 每次成功的 signal 分析都会自动读取 `Pad-step3-rec.root/TrackArrivalEvents`，在
-`Combine/time_resolution/` 生成 BM2−Tracker1/2/3 的 sigmoid t20 时间差高斯拟合图、
-拟合参数表、逐探测器时间分辨和 ROOT 对象，并作为 signal 输出记录进 manifest。
+`Combine/time_resolution/` 并行生成 sigmoid 恒比 20%、30%、40%、50%（t20/t30/t40/t50）
+的 BM2−Tracker 时间差分布、拟合参数和逐探测器时间分辨。旧的 t20 文件仍保留在该目录，
+t30、t40、t50 的完整结果分别位于同名子目录；`cfd_fraction_resolution.png/.tsv` 汇总各比例的
+逐探测器时间分辨。全部正式结果作为 signal 输出记录进 manifest。
 默认时间样本要求 `bmS_n[1] == 1`，即 BM2 在径迹预测点周围 3×3 匹配窗口内恰好一个
-具有有效 sigmoid t20 的 pad；可用 `timing_cuts.bm2_matched_pad_count=0` 关闭。若某块探测器未接入，用 run 配置中的 `timing_cuts.detectors` 将其从逐探测器方差联合解中排除。
+具有有效 sigmoid 拟合的 pad；四个恒比时刻来自同一波形拟合，样本选择保持一致。可用
+`timing_cuts.bm2_matched_pad_count=0` 关闭。若某块探测器未接入，用 run 配置中的
+`timing_cuts.detectors` 将其从逐探测器方差联合解中排除。
+
+另外，`cluster_timing.enabled=true` 会在独立的 `cluster_timing` 阶段分析与径迹匹配的
+cluster 时间，结果写入 `Combine/time_resolution/cluster/<execution_id>/`，不覆盖上面的
+单 pad 结果。空间聚类仍使用同一 BM 内四邻接 pad；只要 cluster 的任一成员位于原来的
+3×3 匹配窗口内，它就是候选。要求 BM2 恰好一个空间候选 cluster，且其中至少一个 pad
+具有有效 sigmoid 拟合；多个候选（包括没有有效时间的候选）会被排除。计时使用整个 cluster 的
+有效 pad，各 pad 等权平均，并另存最早时间；同一 pad 的重复记录使用 maxA 最大者。
+允许多 pad cluster，不施加 `bmS_n[1]==1`。这仍是窗口关联，不额外施加 cluster 质心残差 cut。
+
+`BM1Events/BM2Events` 新增 `hit_cluster_index`、`hit_time_sigmoid[30,40,50]` 及
+`cluster_time_sigmoid[30,40,50]_{mean,min,n}`。`TrackArrivalEvents` 新增
+`bmClusterS[30,40,50]_{mean,min,n}`、
+`bm_matched_cluster_{count,index,size,dx,dy}`；数组下标 0/1 对应 BM1/BM2，时间单位仍是
+25 ns 采样点，dx/dy 为 cluster 质心减去对齐后的预测位置（mm）。旧 event 时间和 `bmS_*`
+含义不变。新增分支的数值单位仍是 25 ns 采样点。新模式的 `time_resolution.json.single_pad_comparison` 同时记录各自全样本与
+共同事件样本的结果，便于区分时间定义和样本选择的影响。
+
+对包含新增分支的 Pad ROOT，也可从 APV25 项目根目录单独执行：
+
+```bash
+cd /home/thoriatong/workplace/APV25
+source /home/thoriatong/root/bin/thisroot.sh
+/usr/bin/python3 BTTracker/scripts/analyze_time_resolution.py batches/run_009/Combine/Pad-step3-rec.root \
+  --bm-time-source cluster --detectors BM2,Tracker1,Tracker2,Tracker3 \
+  --output-dir batches/run_009/Combine/time_resolution/cluster/manual
+```
+
+旧 Pad ROOT 需要先重新执行 PadReconstruction；单独运行脚本不能从缺少成员时间的旧
+cluster 分支恢复 cluster 时间。正式运行请使用 `run.sh`，以记录配置快照、哈希和阶段状态。
 `--plots` 只用于额外的峰数诊断和历史兼容 Δt 图。某个 run 或某个 stage 失败不会阻止其他 run；
 批次最终返回非零，并把汇总写到 `metadata/batch_executions/<ID>/summary.tsv`。
+
+signal 完成后默认还会运行独立的 `snr_timing` 诊断阶段：按
+合成配置中的 `snr_timing.bin_edges` 分组（公共配置、run 覆盖及独立脚本的区别见
+[SNR 配置说明](../docs/BM_SNR_TIMING_DIAGNOSTICS.md#分组配置的来源)），
+计算 BM2 与三层 Tracker 的逐探测器时间分辨，并导出每组六个探测器对的时间差分布和逐事件中间量。
+结果位于 `Combine/time_resolution/snr_binned/<execution_id>/`，同样写入 execution manifest，
+每组计算过程直接位于其 `pairwise_details/SNR_<下限>_<上限>/` 子目录。
+成功分析后，仅最终数值和分辨率汇总图进入 `Results/<execution_id>/timing/time_resolution/snr_binned/`；
+逐事件数据、时间差分布和拟合过程保留在 Combine。该诊断固定选择恰有一个
+有效匹配 BM2 pad 的事件，不改变 Step2 或主时间分辨的 selection；低于 40 个事件的区间会标记为统计量不足。
+可在 run-local `config/configCR.json` 设置 `snr_timing.enabled=false` 关闭。
+`--force 0` 会按诊断配置、输入/正式分析指纹、诊断代码和产物哈希复用该 stage；
+`--force 1` 则为当前执行重新生成。
 
 `--force 0` 只复用输入文件、配置快照、代码指纹和输出哈希全部匹配的成功执行；存在无法验证的旧输出时会要求 `--force 1`。
 
@@ -76,11 +122,35 @@ Tracker Step3 的 `Track0/1/2` 只保存六个 Tracker 方向中至少一个有 
 
 ## 结果导出
 
+managed run 的 `signal` / `all` 在本次所有请求阶段成功后，自动生成
+`Results/<execution_id>/`；`metadata/latest_results.json` 指向最近一次成功归档。
+只运行 noise 或有阶段失败时不自动发布。导出失败会报告 `partial_failed`，
+已成功的分析及 Combine 文件保留，可以单独重试导出，无需重跑物理分析。
+
+```text
+Results/<execution_id>/
+├── README.md                    # 最终结果文件索引
+├── timing/time_resolution/      # 时间分辨、误差、CFD/SNR 汇总
+└── metadata/                    # 配置快照、来源 manifest、输入和结果哈希
+```
+
+最终结果包括 `detector_time_resolution.tsv`、`pairwise_time_resolution.tsv`、
+`time_resolution.json` 和 `cfd_fraction_resolution.tsv/.png/.pdf`；开启 cluster 或 SNR
+分析时，归档本次执行对应的最终数值与汇总图。SNR 的逐探测器结果表放在
+`snr_binned/<source_execution_id>/detector_solutions/`。
+step1–4、Pad ROOT、噪声标定、残差/时间差分布、高斯诊断图和逐事件计算过程只保存在
+`Combine/`。时间分析的工作副本仍保留在 `Combine/time_resolution/`，用于缓存校验和诊断。
+
+也可对最近成功的 signal 手动命名导出：
+
 ```bash
+cd /home/thoriatong/workplace/APV25/BTTracker
 ./export_results.sh ../batches/run_001 sigmoid_t20_v1
 ```
 
-导出器验证最近成功执行的输入列表与 SHA-256、配置快照、所有 ROOT 输出哈希，再创建 `Results/sigmoid_t20_v1/`。同名标签不会被覆盖。新 signal 执行把 run 内 noise 参数作为输入依赖并记录哈希，因此必须先完成 noise 标定。
+导出器验证执行的输入列表与 SHA-256、配置快照及记录的中间输出哈希，再按最终结果白名单复制文件。
+同名标签不会被覆盖，已有 Results 不会自动迁移。可加 `--execution-id <id>` 指定历史执行，
+其输入和输出必须仍匹配 manifest。noise 参数作为依赖单独校验，不计入宇宙线 ROOT 文件列表。
 
 ## 构建
 
@@ -88,8 +158,19 @@ Tracker Step3 的 `Track0/1/2` 只保存六个 Tracker 方向中至少一个有 
 
 ```bash
 source /home/thoriatong/root/bin/thisroot.sh
+cd /home/thoriatong/workplace/APV25/BTTracker
 cmake -S . -B build_apv25
 cmake --build build_apv25 -j4
 ```
 
 可用 `BTTRACKER_BUILD_DIR` 和 `BTTRACKER_BUILD_JOBS` 覆盖构建位置与并行数。
+
+## 独立分析入口
+
+主时间分辨、角度分组、空间分格和 cluster 分布的选择条件不同，见
+[分析样本与 cut 对照](../docs/ANALYSIS_SELECTIONS.md)。
+[BM2 位置 cut 时间分析](../docs/BM2_POSITION_CUT.md) 和
+[BM 簇数/簇大小分布](../docs/BM_CLUSTER_DISTRIBUTIONS.md)
+提供完整命令及输出说明；这些独立工具的产物保存在对应 run 的 Combine 中。
+
+运行状态索引位于 ../batches/run_status.tsv，每次导入或批处理后自动刷新；也可从 BTTracker/ 执行 python3 scripts/run_status.py ../batches 手动重建。项目根目录的 [README](../README.md) 提供统一导航。

@@ -29,5 +29,12 @@
   },
   "timing_cuts": {
     "bm2_matched_pad_count": 1
+  },
+  "cluster_timing": {
+    "enabled": true
+  },
+  "snr_timing": {
+    "enabled": true,
+    "bin_edges": [10, 30, 50, 70, 90, 120]
   }
 }

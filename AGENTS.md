@@ -49,6 +49,11 @@ batches/run_NNN/
 
 每次执行从公共静态配置和 `run/config/` 生成独立配置快照。噪声标定只能写入该 run 的 `Combine/noise/`，不得写回公共 `BTTracker/config/`。旧 2290 通道标定仅作历史参考，不进入新快照。
 
+包含 signal 的 managed run 在本次所有请求阶段成功后，自动生成不可覆盖的
+`Results/<execution_id>/`，仅归档最终时间分辨数值、误差、汇总图及配置/来源记录。
+step1–4、Pad ROOT、残差/时间差分布、噪声标定和逐事件计算过程保存在 `Combine/`；
+时间分析工作副本也保留在 Combine 供复用校验。不得把整个 Combine 复制进 Results。
+
 ## 当前分析链
 
 ```text

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Publish an immutable, verified snapshot from a managed BTTracker run."""
+"""Publish final timing results; keep reconstruction and diagnostics in Combine."""
 
 import argparse
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
 import shutil
@@ -36,9 +35,10 @@ def relative_child(parent, name):
     return candidate
 
 
-def execution_for(run, stage):
-    pointer = load_json(run / 'metadata' / f'latest_{stage}.json')
-    execution_id = pointer['execution_id']
+def execution_for(run, stage, execution_id=None):
+    if execution_id is None:
+        pointer = load_json(run / 'metadata' / f'latest_{stage}.json')
+        execution_id = pointer['execution_id']
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', execution_id):
         raise ValueError(f'Invalid {stage} execution ID')
     execution = run / 'metadata' / 'executions' / execution_id
@@ -66,11 +66,14 @@ def execution_for(run, stage):
         for path in {source, linked}:
             if not path.is_file() or sha256(path) != record['sha256']:
                 raise ValueError(f'{stage} input changed since analysis: {path}')
-        expected_paths.add(linked.resolve())
+        # Calibration is also a signal input, but is not a physics acquisition.
+        # Older manifests did not record roles and contained only acquisitions.
+        if record.get('role', 'acquisition') == 'acquisition':
+            expected_paths.add(linked.resolve())
     folder = run / 'Tracker' / ('physics' if stage == 'signal' else 'noise')
     present_paths = {p.resolve() for p in folder.iterdir()
                      if p.suffix.lower() == '.root' and p.is_file()}
-    if expected_paths != present_paths:
+    if not expected_paths or expected_paths != present_paths:
         raise ValueError(f'{stage} input file list changed since analysis: {folder}')
     outputs = {}
     for name, digest in manifest.get('outputs', {}).items():
@@ -101,18 +104,36 @@ def copy_file(source, destination):
 
 
 def output_destination(name):
-    relative = name.removeprefix('Combine/')
-    if relative.startswith('noise/'):
-        return relative
-    if relative.startswith('time_resolution/'):
-        return 'timing/' + relative
-    if relative.startswith('sigmoid_only/'):
-        return 'timing/' + relative.removeprefix('sigmoid_only/')
-    if relative == 'peak_summary.tsv' or Path(relative).name.startswith('peaks_'):
-        return 'diagnostics/peaks/' + Path(relative).name
-    if Path(relative).name.startswith('MMalignmentPar'):
-        return 'metadata/alignment/' + Path(relative).name
-    return 'analysis/' + relative
+    """Explicit final-result allowlist; a new diagnostic is never auto-published."""
+    parts = Path(name).parts
+    if len(parts) < 3 or parts[:2] != ('Combine', 'time_resolution'):
+        return None
+    relative = Path(*parts[1:])
+    tail = parts[2:]
+    if tail[0] == 'snr_binned':
+        if len(tail) == 3 and tail[-1] in {
+                'snr_bins.tsv', 'snr_thresholds.tsv', 'snr_bands.tsv',
+                'snr_timing_report.json', 'snr_threshold_scan.png',
+                'snr_threshold_scan.pdf'}:
+            return 'timing/' + relative.as_posix()
+        if (len(tail) in (5, 6) and tail[2] == 'pairwise_details'
+                and tail[-2].startswith('SNR_')
+                and tail[-1] == 'detector_solution.tsv'):
+            # Accept both new run-local SNR_* paths and historical run_NNN/SNR_*
+            # paths; publish only the useful final table, without a second run.
+            return ('timing/' + Path(*parts[1:4], 'detector_solutions',
+                                     tail[-2], tail[-1]).as_posix())
+        return None
+    if tail[0] == 'cluster':
+        tail = tail[2:]  # cluster/<execution_id>/<summary or CFD directory>
+    if len(tail) == 2 and tail[0] in ('t30', 't40', 't50'):
+        tail = tail[1:]
+    if len(tail) == 1 and tail[0] in {
+            'detector_time_resolution.tsv', 'pairwise_time_resolution.tsv',
+            'time_resolution.json', 'cfd_fraction_resolution.tsv',
+            'cfd_fraction_resolution.png', 'cfd_fraction_resolution.pdf'}:
+        return 'timing/' + relative.as_posix()
+    return None
 
 
 def write_hashes(destination, root, files):
@@ -121,17 +142,22 @@ def write_hashes(destination, root, files):
             stream.write(f'{sha256(path)}  {path.relative_to(root).as_posix()}\n')
 
 
-def export(run, tag, run_id):
+def export(run, tag, run_id=None, execution_id=None):
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', tag):
+        raise ValueError('Invalid result tag')
     results = run / 'Results'
     target = results / tag
     if target.exists() or target.is_symlink():
         raise ValueError(f'Refusing to overwrite published result: {target}')
-    signal = execution_for(run, 'signal')
+    signal = execution_for(run, 'signal', execution_id)
+    for name in ('detector_time_resolution.tsv', 'time_resolution.json'):
+        if f'Combine/time_resolution/{name}' not in signal['outputs']:
+            raise ValueError(f'No verified final timing result: missing {name}')
     noise = None
     noise_status = 'unavailable: no successful noise execution'
     try:
         noise = execution_for(run, 'noise')
-        noise_status = 'included'
+        noise_status = 'metadata only; calibration products remain in Combine/noise'
     except (ValueError, KeyError, OSError) as error:
         noise_status = f'unavailable: {error}'
     results.mkdir(exist_ok=True)
@@ -139,6 +165,7 @@ def export(run, tag, run_id):
     try:
         metadata = staging / 'metadata'
         metadata.mkdir()
+        published = {}
         for stage, record in (('signal', signal), ('noise', noise)):
             if record is None:
                 continue
@@ -146,11 +173,17 @@ def export(run, tag, run_id):
             shutil.copytree(record['config'], snapshot)
             copy_file(record['directory'] / 'manifest.json', metadata / f'{stage}_manifest.json')
             for name, source in record['outputs'].items():
-                copy_file(source, staging / output_destination(name))
+                destination = output_destination(name)
+                if destination is None:
+                    continue
+                copy_file(source, staging / destination)
+                published[destination] = name
             # Hash the files after copying too, so a concurrently rerun source
             # cannot silently produce an export inconsistent with its manifest.
             for name, digest in record['manifest']['outputs'].items():
-                if name in record['outputs'] and sha256(staging / output_destination(name)) != digest:
+                destination = output_destination(name)
+                if (name in record['outputs'] and destination is not None
+                        and sha256(staging / destination) != digest):
                     raise ValueError(f'{stage} output changed during export: {name}')
         details = {
             'analysis_tag': tag, 'run_id': run_id or run.name, 'run_directory': str(run),
@@ -159,11 +192,10 @@ def export(run, tag, run_id):
             'noise_execution_id': noise['id'] if noise else None,
             'noise_status': noise_status,
             'configuration_source': 'successful execution snapshot',
-            'bm_alignment': 'included' if (metadata / 'alignment' / 'MMalignmentParBM.dat').is_file()
-                            else 'not produced (optional)',
-            'peak_diagnostic_pngs': len(list((staging / 'diagnostics' / 'peaks').glob('peaks_*.png'))),
-            'timing_available': ((staging / 'timing/time_resolution/bm2_tracker_time_differences.root').is_file() or
-                                 (staging / 'timing/delta_histograms.root').is_file()),
+            'result_scope': 'final timing tables, reports and summary plots',
+            'intermediates_directory': str(run / 'Combine'),
+            'published_files': published,
+            'timing_available': True,
         }
         (metadata / 'analysis.json').write_text(json.dumps(details, indent=2, ensure_ascii=False)+'\n', encoding='utf-8')
         input_records = {'signal': signal['inputs'], 'noise': noise['inputs'] if noise else []}
@@ -175,6 +207,13 @@ def export(run, tag, run_id):
         config_files = list((metadata / 'config_snapshot').rglob('*'))
         config_files += list((metadata / 'noise_config_snapshot').rglob('*'))
         write_hashes(metadata / 'config_sha256.txt', staging, (p for p in config_files if p.is_file()))
+        index = [f'# {run_id or run.name}: {tag}', '',
+                 'Final timing results / 最终时间分辨结果。', '',
+                 'Step1–4、Pad ROOT、噪声标定、残差/时间差分布和逐事件计算过程保存在',
+                 '[Combine](../../Combine/)。配置快照、来源及 SHA-256 保存在 [metadata](metadata/)。', '',
+                 '## 结果文件', '']
+        index += [f'- [{name}]({name})' for name in sorted(published)]
+        (staging / 'README.md').write_text('\n'.join(index) + '\n', encoding='utf-8')
         write_hashes(metadata / 'result_sha256.txt', staging, (p for p in staging.rglob('*')
                      if p.is_file() and p != metadata / 'result_sha256.txt'))
         if target.exists() or target.is_symlink():
@@ -186,7 +225,8 @@ def export(run, tag, run_id):
         raise
     print(f'Published immutable result directory: {target}')
     print(f"Signal execution: {signal['id']}; noise: {noise_status}")
-    print(f"Peak diagnostic PNGs: {details['peak_diagnostic_pngs']}; timing: {details['timing_available']}")
+    print(f'Final timing files: {len(published)}; intermediates remain in {run / "Combine"}')
+    return target
 
 
 def main():
@@ -194,6 +234,7 @@ def main():
     parser.add_argument('run_directory', type=Path)
     parser.add_argument('analysis_tag')
     parser.add_argument('run_id', nargs='?')
+    parser.add_argument('--execution-id', help='export this execution instead of latest_signal')
     args = parser.parse_args()
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', args.analysis_tag):
         parser.error('analysis_tag must contain only letters, digits, dots, underscores and hyphens')
@@ -201,7 +242,7 @@ def main():
         run = args.run_directory.resolve(strict=True)
         if not run.is_dir():
             raise ValueError(f'Not a run directory: {run}')
-        export(run, args.analysis_tag, args.run_id)
+        export(run, args.analysis_tag, args.run_id, args.execution_id)
     except (ValueError, KeyError, OSError) as error:
         print(f'ERROR: {error}', file=sys.stderr)
         return 1

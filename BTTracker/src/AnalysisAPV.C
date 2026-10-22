@@ -351,6 +351,9 @@ bool AnalysisAPV::Init()
     fanaTree[i]->Branch("arrivalT_sigmoid", &arrivalT_sigmoid);
     fanaTree[i]->Branch("arrivetime_sigmoid", &arrivalT_sigmoid);
     fanaTree[i]->Branch("sigmoid_t20", &arrivalT_sigmoid);
+    fanaTree[i]->Branch("arrivalT_sigmoid30", &arrivalT_sigmoid30);
+    fanaTree[i]->Branch("arrivalT_sigmoid40", &arrivalT_sigmoid40);
+    fanaTree[i]->Branch("arrivalT_sigmoid50", &arrivalT_sigmoid50);
     fanaTree[i]->Branch("sigmoid_t50", &sigmoidT50);
     fanaTree[i]->Branch("sigmoid_B", &sigmoidBaseline);
     fanaTree[i]->Branch("sigmoid_H", &sigmoidHeight);
@@ -392,6 +395,9 @@ bool AnalysisAPV::Init()
   bmTree->Branch("arrivalT_sigmoid", &arrivalT_sigmoid);
   bmTree->Branch("arrivetime_sigmoid", &arrivalT_sigmoid);
   bmTree->Branch("sigmoid_t20", &arrivalT_sigmoid);
+  bmTree->Branch("arrivalT_sigmoid30", &arrivalT_sigmoid30);
+  bmTree->Branch("arrivalT_sigmoid40", &arrivalT_sigmoid40);
+  bmTree->Branch("arrivalT_sigmoid50", &arrivalT_sigmoid50);
   bmTree->Branch("sigmoid_t50", &sigmoidT50);
   bmTree->Branch("sigmoid_B", &sigmoidBaseline);
   bmTree->Branch("sigmoid_H", &sigmoidHeight);
@@ -890,6 +896,9 @@ double AnalysisAPV::FitPulseArrivalTime()
   arrivalT_a = -999;
   arrivalT_e = -999;
   arrivalT_sigmoid = -999;
+  arrivalT_sigmoid30 = -999;
+  arrivalT_sigmoid40 = -999;
+  arrivalT_sigmoid50 = -999;
   sigmoidT50 = -999;
   sigmoidBaseline = -999;
   sigmoidHeight = -999;
@@ -981,6 +990,9 @@ double AnalysisAPV::FitPulseArrivalTime()
 double AnalysisAPV::FitSigmoidArrivalTime()
 {
   arrivalT_sigmoid = -999;
+  arrivalT_sigmoid30 = -999;
+  arrivalT_sigmoid40 = -999;
+  arrivalT_sigmoid50 = -999;
   sigmoidT50 = -999;
   sigmoidBaseline = -999;
   sigmoidHeight = -999;
@@ -1054,6 +1066,9 @@ double AnalysisAPV::FitSigmoidArrivalTime()
   sigmoidT50 = fitFunc.GetParameter(2);
   sigmoidK = fitFunc.GetParameter(3);
   arrivalT_sigmoid = SigmoidFractionTime(sigmoidT50, sigmoidK, 0.20);
+  arrivalT_sigmoid30 = SigmoidFractionTime(sigmoidT50, sigmoidK, 0.30);
+  arrivalT_sigmoid40 = SigmoidFractionTime(sigmoidT50, sigmoidK, 0.40);
+  arrivalT_sigmoid50 = sigmoidT50;
   const int ndf = fitFunc.GetNDF();
   if (ndf > 0)
     sigmoidFitChi2NDF = fitFunc.GetChisquare() / ndf;
@@ -1063,6 +1078,12 @@ double AnalysisAPV::FitSigmoidArrivalTime()
     arrivalT_sigmoid = -999;
     return arrivalT_sigmoid;
   }
+  if (!std::isfinite(arrivalT_sigmoid30))
+    arrivalT_sigmoid30 = -999;
+  if (!std::isfinite(arrivalT_sigmoid40))
+    arrivalT_sigmoid40 = -999;
+  if (!std::isfinite(arrivalT_sigmoid50))
+    arrivalT_sigmoid50 = -999;
   return arrivalT_sigmoid;
 }
 bool AnalysisAPV::SelectPulseWaveform()
@@ -1191,6 +1212,9 @@ void AnalysisAPV::InitData()
   arrivalT_a = -999;
   arrivalT_e = -999;
   arrivalT_sigmoid = -999;
+  arrivalT_sigmoid30 = -999;
+  arrivalT_sigmoid40 = -999;
+  arrivalT_sigmoid50 = -999;
   sigmoidT50 = -999;
   sigmoidBaseline = -999;
   sigmoidHeight = -999;

@@ -28,7 +28,7 @@
 
 `MMdetN=3`，每层四块 APV：chip0/1→X，chip2/3→Y。
 
-- `AnalysisAPV`：signal 输入设置 pedestal/RMS 为 0；执行波形基本 cut、显著单峰选择和 sigmoid t20 拟合，写 6 个 Tracker 树与 `BMPadSignals`。
+- `AnalysisAPV`：signal 输入设置 pedestal/RMS 为 0；执行波形基本 cut、显著单峰选择，并从一次 sigmoid 拟合计算 t20/t30/t40/t50，写 6 个 Tracker 树与 `BMPadSignals`。逐通道 noise sigma 单独用于显著峰最低高度。
 - `DecodeAPV`：先取六个 Tracker 方向的原始 event 并集并压缩为三棵树共享的显式 `entry=1..N`，再按 strip 相邻关系聚类、选择主 cluster，写 `Track0..2`；原始 `event` 不重编号，供 BM 和下游关联。
 - `ReconstructTrack`：三层直线拟合、alignment、残差、效率和每层预测 strip，写 `Track`。
 - `PadReconstruction`：按 BM 分别聚类并写 `BM1Events`、`BM2Events`；把 BM 3×3 窗口和 Tracker 预测 strip 的时间与径迹关联，写 `TrackArrivalEvents`。未接入 BM 可在 run 配置中关闭，其事件树保持零条目。
@@ -53,4 +53,7 @@
 
 `debug/macros/plot_peak_timing.C` 从 ROOT 中动态发现 `PeakCount_all_*`，三层配置当前产生 14 组、28 张峰数图，并固定产生 4 张 sigmoid Δt 图。数量不再写死为旧四层的 34 张。
 
-`scripts/export_run.py` 只导出 manifest 中记录且哈希仍匹配的文件，配置来自成功执行快照。旧的四层 Tracker 重跑/验证宏已经删除，当前诊断绘图入口为 `debug/macros/plot_peak_timing.sh`。
+`scripts/export_run.py` 从 manifest 中记录且哈希仍匹配的产物里按最终结果白名单导出，配置来自成功执行快照。时间差分布、高斯诊断图和逐事件过程保留在 Combine。
+
+当前还有角度分组、BM 空间分格、BM cluster 分布和位置 cut 时间分析等独立入口，见
+[宏与诊断工具](macros_usage.md) 和 [分析样本与 cut 对照](ANALYSIS_SELECTIONS.md)。

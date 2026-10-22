@@ -86,6 +86,13 @@ cd /home/thoriatong/workplace/APV25/BTTracker
 - `configCR.json` 按 JSON 对象递归合并，可只写需要变化的键；
 - mapping 等其他文件按相对路径替换。
 
+SNR 分组时间诊断在公共配置中默认开启；区间由合成配置决定，当前公共值及独立脚本的区别见
+[SNR 配置说明](BM_SNR_TIMING_DIAGNOSTICS.md#分组配置的来源)。某组 run 可在
+`config/configCR.json` 覆盖 `snr_timing.bin_edges`，或设
+`snr_timing.enabled=false` 关闭。它是 signal 后的独立 stage；状态、日志与每个产物哈希
+都保存在 execution manifest 中，且按 execution ID 保存，不会覆盖之前的诊断文件。
+`--force 0` 复用指纹与产物哈希均匹配的成功 SNR stage；`--force 1` 重新计算并生成新的目录。
+
 生成的 pedestal/noise 文件不能放入 `run/config/`，它们属于 `Combine/noise/`。每次执行快照保存于 `metadata/executions/<ID>/config/`。
 
 机械位置不变时可用 `--alignment-source /path/to/Combine` 为尚无 alignment 的 run 复制已有参数；目标已存在时不覆盖。
@@ -105,10 +112,28 @@ metadata/batch_executions/<batch_id>/summary.tsv
 metadata/batch_executions/<batch_id>/summary.json
 ```
 
-正式发布：
+`batches/run_status.tsv` 是所有已管理 run 的轻量状态索引，包含最近执行、noise/signal/cluster/SNR 阶段状态、SNR 分组边界、Results 导出编号及输入 ROOT 数量。创建 run 和批处理结束时自动刷新；也可在 `BTTracker/` 手动运行 `python3 scripts/run_status.py ../batches`。该文件是可重建的本地导航信息，不进入 Git 代码备份。
+
+包含 signal 的 managed run 在本次所有请求阶段成功后，自动发布到
+`Results/<execution_id>/`，并更新 `metadata/latest_results.json`。
+noise-only 执行和未全部成功的执行不自动发布；导出失败记录为 `partial_failed`，
+Combine 中已完成的分析保留。手动命名或重试发布：
 
 ```bash
 ./export_results.sh ../batches/run_001 sigmoid_t20_v1
 ```
 
-导出器重新验证输入、配置和输出哈希，复制最近成功的 signal，若有独立成功的 noise 也一并包含。绘图只有在执行时加过 `--plots` 且被该 manifest 记录时才导出。同名 `Results/<tag>` 拒绝覆盖。
+导出器重新验证输入、配置和输出哈希，只复制该 signal 执行中被记录的最终时间分辨表、
+报告和汇总图。噪声标定作为 signal 的依赖校验，不当作 physics 目录中的采集文件。
+同次执行成功的 cluster/SNR 最终结果也会归档；不会从其他执行的 latest 指针混入旧结果。
+
+- `Results/<id或tag>/timing/time_resolution/`：逐探测器分辨与误差、两两时间统计、
+  CFD 比例比较表/图；开启时包含 cluster 和 SNR 的最终数值与分辨率汇总图。
+- `Results/<id或tag>/metadata/`：配置快照、来源 manifest、输入及结果哈希；
+  `analysis.json.published_files` 记录每个最终文件对应的 Combine 来源。
+- `Combine/`：step1–4、Pad ROOT、alignment、噪声标定、残差/时间差分布、
+  高斯拟合诊断、波形图、逐事件表与迭代过程。`--plots` 生成的诊断也留在这里。
+
+同名 `Results/<id或tag>` 拒绝覆盖；已有正式结果保留原样。
+时间分析在 Combine 的工作副本用于复用与哈希校验，不能为节省空间直接移走。
+手动导出默认选择 `latest_signal`，也可加 `--execution-id <id>`，前提是该执行的文件仍可验证。

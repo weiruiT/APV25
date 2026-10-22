@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Estimate per-detector timing resolution from TrackArrivalEvents.
 
-The stored sigmoid t20 values are in APV samples (25 ns/sample).  A Tracker
+The stored sigmoid t20/t30/t40/t50 values are in APV samples (25 ns/sample).
+A Tracker
 event time is the strip-count-weighted mean of its matched X/Y clusters.  The
 Each detector pair uses all events available to that pair; a Tracker pools
 whichever matched X/Y axes are valid.  Common trigger jitter is removed by
@@ -35,6 +36,7 @@ except ImportError as exc:
 
 SAMPLE_NS = 25.0
 DETECTORS = ("BM1", "BM2", "Tracker1", "Tracker2", "Tracker3")
+TIMING_METHODS = ("t20", "t30", "t40", "t50")
 
 
 def valid_time(value: float) -> bool:
@@ -192,8 +194,12 @@ def solve_weighted_variances(
     }
 
 def read_events(
-    path: Path, bm2_matched_pad_count: int = 0
+    path: Path, bm2_matched_pad_count: int = 0, bm_time_source: str = "pad"
 ) -> tuple[list[dict[str, object]], dict[str, int], int]:
+    if bm_time_source not in ("pad", "cluster"):
+        raise ValueError("bm_time_source must be pad or cluster")
+    if bm_time_source == "cluster" and bm2_matched_pad_count != 0:
+        raise ValueError("cluster timing must not apply a single-pad multiplicity cut")
     root_file = ROOT.TFile.Open(str(path), "READ")
     if not root_file or root_file.IsZombie():
         raise RuntimeError(f"cannot open {path}")
@@ -202,90 +208,118 @@ def read_events(
         raise RuntimeError(f"TrackArrivalEvents is missing in {path}")
 
     event = array("i", [0])
-    bm_mean = array("d", [0.0] * 2)
-    bm_min = array("d", [0.0] * 2)
-    bm_count = array("i", [0] * 2)
-    tracker_mean = array("d", [0.0] * 6)
-    tracker_min = array("d", [0.0] * 6)
-    tracker_count = array("i", [0] * 6)
-    for branch, target in (
-        ("event", event),
-        ("bmS_mean", bm_mean),
-        ("bmS_min", bm_min),
-        ("bmS_n", bm_count),
-        ("trS_mean", tracker_mean),
-        ("trS_min", tracker_min),
-        ("trS_n", tracker_count),
-    ):
+    bm_mean = {method: array("d", [0.0] * 2) for method in TIMING_METHODS}
+    bm_min = {method: array("d", [0.0] * 2) for method in TIMING_METHODS}
+    bm_count = {method: array("i", [0] * 2) for method in TIMING_METHODS}
+    cluster_count = array("i", [0] * 2)
+    tracker_mean = {method: array("d", [0.0] * 6) for method in TIMING_METHODS}
+    tracker_min = {method: array("d", [0.0] * 6) for method in TIMING_METHODS}
+    tracker_count = {method: array("i", [0] * 6) for method in TIMING_METHODS}
+    for branch, target in (("event", event),):
         if not tree.GetBranch(branch):
             raise RuntimeError(f"required branch {branch} is missing")
         tree.SetBranchAddress(branch, target)
+    bm_stem = "bmClusterS" if bm_time_source == "cluster" else "bmS"
+    for method in TIMING_METHODS:
+        suffix = "" if method == "t20" else method[1:]
+        branches = (
+            (f"{bm_stem}{suffix}_mean", bm_mean[method]),
+            (f"{bm_stem}{suffix}_min", bm_min[method]),
+            (f"{bm_stem}{suffix}_n", bm_count[method]),
+            (f"trS{suffix}_mean", tracker_mean[method]),
+            (f"trS{suffix}_min", tracker_min[method]),
+            (f"trS{suffix}_n", tracker_count[method]),
+        )
+        for branch, target in branches:
+            if not tree.GetBranch(branch):
+                raise RuntimeError(
+                    f"required branch {branch} is missing; rerun the signal workflow to rebuild Step2/Step3"
+                )
+            tree.SetBranchAddress(branch, target)
+    if bm_time_source == "cluster":
+        if not tree.GetBranch("bm_matched_cluster_count"):
+            raise RuntimeError("cluster timing branches are missing; rerun pad reconstruction")
+        tree.SetBranchAddress("bm_matched_cluster_count", cluster_count)
 
     availability = {name: 0 for name in DETECTORS}
     records: list[dict[str, object]] = []
     total_entries = int(tree.GetEntries())
     for entry in range(total_entries):
         tree.GetEntry(entry)
-        if (
-            bm2_matched_pad_count > 0
-            and int(bm_count[1]) != bm2_matched_pad_count
+        if bm_time_source == "cluster" and (
+            cluster_count[1] != 1 or bm_count["t20"][1] <= 0
         ):
             continue
-        mean_times = [float(bm_mean[0]), float(bm_mean[1])]
-        min_times = [float(bm_min[0]), float(bm_min[1])]
-        detector_valid = [
-            bm_count[0] > 0 and valid_time(mean_times[0]) and valid_time(min_times[0]),
-            bm_count[1] > 0 and valid_time(mean_times[1]) and valid_time(min_times[1]),
-        ]
-        for tracker in range(3):
-            x_index = 2 * tracker
-            y_index = x_index + 1
-            nx = int(tracker_count[x_index])
-            ny = int(tracker_count[y_index])
-            x_valid = (
-                nx > 0
-                and valid_time(float(tracker_mean[x_index]))
-                and valid_time(float(tracker_min[x_index]))
-            )
-            y_valid = (
-                ny > 0
-                and valid_time(float(tracker_mean[y_index]))
-                and valid_time(float(tracker_min[y_index]))
-            )
-            tracker_valid = x_valid or y_valid
-            detector_valid.append(tracker_valid)
-            if tracker_valid:
-                valid_nx = nx if x_valid else 0
-                valid_ny = ny if y_valid else 0
-                mean_times.append(
-                    (
-                        valid_nx * float(tracker_mean[x_index])
-                        + valid_ny * float(tracker_mean[y_index])
-                    )
-                    / (valid_nx + valid_ny)
+        if (
+            bm2_matched_pad_count > 0
+            and int(bm_count["t20"][1]) != bm2_matched_pad_count
+        ):
+            continue
+        record: dict[str, object] = {"event": int(event[0])}
+        for method in TIMING_METHODS:
+            mean_times = [float(bm_mean[method][0]), float(bm_mean[method][1])]
+            min_times = [float(bm_min[method][0]), float(bm_min[method][1])]
+            detector_valid = [
+                bm_count[method][index] > 0
+                and valid_time(mean_times[index])
+                and valid_time(min_times[index])
+                for index in range(2)
+            ]
+            if bm_time_source == "cluster":
+                detector_valid = [
+                    valid and cluster_count[index] == 1
+                    for index, valid in enumerate(detector_valid)
+                ]
+            for tracker in range(3):
+                x_index = 2 * tracker
+                y_index = x_index + 1
+                nx = int(tracker_count[method][x_index])
+                ny = int(tracker_count[method][y_index])
+                x_valid = (
+                    nx > 0
+                    and valid_time(float(tracker_mean[method][x_index]))
+                    and valid_time(float(tracker_min[method][x_index]))
                 )
-                minima = []
-                if x_valid:
-                    minima.append(float(tracker_min[x_index]))
-                if y_valid:
-                    minima.append(float(tracker_min[y_index]))
-                min_times.append(min(minima))
-            else:
-                mean_times.append(math.nan)
-                min_times.append(math.nan)
-        for name, available in zip(DETECTORS, detector_valid):
-            availability[name] += int(available)
-        for index, available in enumerate(detector_valid):
-            if not available:
-                mean_times[index] = math.nan
-                min_times[index] = math.nan
-        records.append(
-            {
-                "event": int(event[0]),
-                "mean": [value * SAMPLE_NS for value in mean_times],
-                "min": [value * SAMPLE_NS for value in min_times],
-            }
-        )
+                y_valid = (
+                    ny > 0
+                    and valid_time(float(tracker_mean[method][y_index]))
+                    and valid_time(float(tracker_min[method][y_index]))
+                )
+                tracker_valid = x_valid or y_valid
+                detector_valid.append(tracker_valid)
+                if tracker_valid:
+                    valid_nx = nx if x_valid else 0
+                    valid_ny = ny if y_valid else 0
+                    mean_times.append(
+                        (
+                            valid_nx * float(tracker_mean[method][x_index])
+                            + valid_ny * float(tracker_mean[method][y_index])
+                        )
+                        / (valid_nx + valid_ny)
+                    )
+                    minima = []
+                    if x_valid:
+                        minima.append(float(tracker_min[method][x_index]))
+                    if y_valid:
+                        minima.append(float(tracker_min[method][y_index]))
+                    min_times.append(min(minima))
+                else:
+                    mean_times.append(math.nan)
+                    min_times.append(math.nan)
+            if method == "t20":
+                for name, available in zip(DETECTORS, detector_valid):
+                    availability[name] += int(available)
+            for index, available in enumerate(detector_valid):
+                if not available:
+                    mean_times[index] = math.nan
+                    min_times[index] = math.nan
+            record["mean" if method == "t20" else f"mean_{method}"] = [
+                value * SAMPLE_NS for value in mean_times
+            ]
+            record["min" if method == "t20" else f"min_{method}"] = [
+                value * SAMPLE_NS for value in min_times
+            ]
+        records.append(record)
     tree.ResetBranchAddresses()
     root_file.Close()
     return records, availability, total_entries
@@ -293,20 +327,23 @@ def read_events(
 
 def analyze(
     records: list[dict[str, object]], estimator: str,
-    active_detectors: tuple[str, ...],
+    active_detectors: tuple[str, ...], timing_method: str = "t20",
 ) -> tuple[
     list[dict[str, object]], dict[str, object], dict[str, object], dict[str, object]
 ]:
+    if timing_method not in TIMING_METHODS:
+        raise ValueError(f"unsupported sigmoid CFD method: {timing_method}")
+    record_key = estimator if timing_method == "t20" else f"{estimator}_{timing_method}"
     rows: list[dict[str, object]] = []
     detector_indices = [DETECTORS.index(name) for name in active_detectors]
     for first_local, first in enumerate(detector_indices):
         for second_local in range(first_local + 1, len(detector_indices)):
             second = detector_indices[second_local]
             differences = [
-                float(record[estimator][first]) - float(record[estimator][second])
+                float(record[record_key][first]) - float(record[record_key][second])
                 for record in records
-                if math.isfinite(float(record[estimator][first]))
-                and math.isfinite(float(record[estimator][second]))
+                if math.isfinite(float(record[record_key][first]))
+                and math.isfinite(float(record[record_key][second]))
             ]
             if len(differences) < 3:
                 raise RuntimeError(f"too few events for {DETECTORS[first]}-{DETECTORS[second]}")
@@ -315,6 +352,7 @@ def analyze(
             rows.append(
                 {
                     "estimator": estimator,
+                    "timing_method": timing_method,
                     "first_index": first_local,
                     "second_index": second_local,
                     "first": DETECTORS[first],
@@ -338,9 +376,14 @@ def analyze(
 
 
 def plot_bm2_tracker_gaussians(
-    records: list[dict[str, object]], output: Path, bm2_matched_pad_count: int
+    records: list[dict[str, object]], output: Path, bm2_matched_pad_count: int,
+    selection_label: str | None = None, timing_method: str = "t20",
 ) -> list[dict[str, object]]:
-    """Fit and plot mean-t20 differences for BM2 versus each Tracker."""
+    """Fit and plot BM2-versus-Tracker timing differences for one CFD level."""
+    if timing_method not in TIMING_METHODS:
+        raise ValueError(f"unsupported sigmoid CFD method: {timing_method}")
+    output.mkdir(parents=True, exist_ok=True)
+    record_key = "mean" if timing_method == "t20" else f"mean_{timing_method}"
     ROOT.gROOT.SetBatch(True)
     ROOT.gStyle.SetOptStat(0)
     ROOT.gStyle.SetOptFit(0)
@@ -348,7 +391,7 @@ def plot_bm2_tracker_gaussians(
     pairs = ((1, 2), (1, 3), (1, 4))
     rows: list[dict[str, object]] = []
     objects: list[tuple[object, object, object, object]] = []
-    selection_label = (
+    selection_label = selection_label or (
         f"BM2 matched pads = {bm2_matched_pad_count}"
         if bm2_matched_pad_count > 0
         else "BM2 matched pad multiplicity uncut"
@@ -358,10 +401,10 @@ def plot_bm2_tracker_gaussians(
         first_name = DETECTORS[first]
         second_name = DETECTORS[second]
         differences = [
-            float(record["mean"][first]) - float(record["mean"][second])
+            float(record[record_key][first]) - float(record[record_key][second])
             for record in records
-            if math.isfinite(float(record["mean"][first]))
-            and math.isfinite(float(record["mean"][second]))
+            if math.isfinite(float(record[record_key][first]))
+            and math.isfinite(float(record[record_key][second]))
         ]
         if len(differences) < 3:
             raise RuntimeError(
@@ -375,12 +418,13 @@ def plot_bm2_tracker_gaussians(
             raise RuntimeError(f"invalid core sigma for {first_name}-{second_name}")
 
         key = f"{first_name}_{second_name}"
+        object_suffix = "" if timing_method == "t20" else f"_{timing_method}"
         display_low = core_mean - 6.0 * core_sigma
         display_high = core_mean + 6.0 * core_sigma
         fit_low = core_mean - 3.0 * core_sigma
         fit_high = core_mean + 3.0 * core_sigma
         histogram = ROOT.TH1D(
-            f"h_{key}",
+            f"h_{key}{object_suffix}",
             (
                 f"{first_name} - {second_name};"
                 f"#Delta t = t_{{{first_name}}} - t_{{{second_name}}} [ns];"
@@ -395,7 +439,9 @@ def plot_bm2_tracker_gaussians(
         histogram.SetLineColor(ROOT.kBlue + 1)
         histogram.SetLineWidth(2)
 
-        gaussian = ROOT.TF1(f"gaus_{key}", "gaus", fit_low, fit_high)
+        gaussian = ROOT.TF1(
+            f"gaus_{key}{object_suffix}", "gaus", fit_low, fit_high
+        )
         gaussian.SetParameters(histogram.GetMaximum(), core_mean, core_sigma)
         gaussian.SetLineColor(ROOT.kRed + 1)
         gaussian.SetLineWidth(3)
@@ -421,7 +467,9 @@ def plot_bm2_tracker_gaussians(
             line.SetLineStyle(2)
             line.SetLineColor(ROOT.kGray + 2)
 
-        canvas = ROOT.TCanvas(f"c_{key}", "time difference", 1000, 720)
+        canvas = ROOT.TCanvas(
+            f"c_{key}{object_suffix}", "time difference", 1000, 720
+        )
         canvas.SetGrid()
         histogram.Draw("HIST")
         gaussian.Draw("SAME")
@@ -472,6 +520,7 @@ def plot_bm2_tracker_gaussians(
         row = {
             "first": first_name,
             "second": second_name,
+            "timing_method": timing_method,
             "raw_events": len(differences),
             "raw_mean_ns": raw_mean,
             "raw_rms_ns": raw_sigma,
@@ -543,7 +592,7 @@ def plot_bm2_tracker_gaussians(
     definition = ROOT.TNamed(
         "TimingDifferenceDefinition",
         (
-            "mean sigmoid t20; 25 ns/sample; pair-specific valid cohorts; "
+            f"mean sigmoid {timing_method}; 25 ns/sample; pair-specific valid cohorts; "
             f"{selection_label}; "
             "core=iterative 3-sigma initialized by median/MAD; histogram "
             "range=core mean +/-6 sigma; Gaussian fit range=core mean +/-3 sigma"
@@ -576,10 +625,101 @@ def serializable(value: object) -> object:
     return value
 
 
+def plot_cfd_fraction_resolution(
+    solutions_by_method: dict[str, dict[str, object]],
+    active_detectors: tuple[str, ...],
+    output: Path,
+) -> None:
+    """Compare weighted-core detector resolutions across sigmoid CFD levels."""
+    ROOT.gROOT.SetBatch(True)
+    canvas = ROOT.TCanvas("c_cfd_fraction_resolution", "CFD timing comparison", 1000, 720)
+    canvas.SetGrid()
+    multigraph = ROOT.TMultiGraph(
+        "cfd_fraction_resolution",
+        ";Sigmoid constant fraction [%];Weighted-core time resolution [ns]",
+    )
+    colors = [ROOT.kBlue + 1, ROOT.kRed + 1, ROOT.kGreen + 2,
+              ROOT.kMagenta + 1, ROOT.kOrange + 7]
+    graphs = []
+    legend = ROOT.TLegend(0.72, 0.68, 0.89, 0.88)
+    any_points = False
+    for detector_index, detector in enumerate(active_detectors):
+        graph = ROOT.TGraphErrors()
+        graph.SetName(f"g_cfd_resolution_{detector}")
+        graph.SetTitle(detector)
+        graph.SetMarkerStyle(20 + detector_index)
+        graph.SetMarkerColor(colors[detector_index % len(colors)])
+        graph.SetLineColor(colors[detector_index % len(colors)])
+        point = 0
+        for method_index, method in enumerate(TIMING_METHODS):
+            result = solutions_by_method[method]["mean"]["weighted_core"]
+            sigma = float(result["resolutions_ns"][detector_index])
+            error = float(result["resolution_uncertainties_ns"][detector_index])
+            if not math.isfinite(sigma) or not math.isfinite(error):
+                continue
+            fraction = 20 + 10 * method_index
+            graph.SetPoint(point, fraction, sigma)
+            graph.SetPointError(point, 0.0, error)
+            point += 1
+        if point:
+            any_points = True
+            multigraph.Add(graph, "LP")
+            legend.AddEntry(graph, detector, "lp")
+            graphs.append(graph)
+    if not any_points:
+        canvas.Close()
+        raise RuntimeError("no finite weighted-core resolutions for CFD comparison plot")
+    multigraph.Draw("A")
+    multigraph.GetXaxis().SetLimits(15.0, 55.0)
+    multigraph.SetMinimum(0.0)
+    legend.Draw()
+    canvas.SaveAs(str(output / "cfd_fraction_resolution.png"))
+    canvas.SaveAs(str(output / "cfd_fraction_resolution.pdf"))
+    canvas.Close()
+
+
+def compare_with_single_pad(
+    source: Path, cluster_records: list[dict[str, object]],
+    active_detectors: tuple[str, ...],
+) -> dict[str, object]:
+    """Separate changes in the estimator from changes in the selected cohort."""
+    pad_records, _, _ = read_events(source, 1)
+    common = ({int(row["event"]) for row in pad_records}
+              & {int(row["event"]) for row in cluster_records})
+    cohorts = {
+        "single_pad_all": pad_records,
+        "cluster_all": cluster_records,
+        "single_pad_common": [row for row in pad_records if row["event"] in common],
+        "cluster_common": [row for row in cluster_records if row["event"] in common],
+    }
+    result = {"common_events": len(common), "cohorts": {}}
+    for name, records in cohorts.items():
+        cohort = {"events": len(records), "estimators": {}}
+        for method in TIMING_METHODS:
+            cohort[method] = {}
+            for estimator in ("mean", "min"):
+                try:
+                    pairs, raw, core, weighted = analyze(
+                        records, estimator, active_detectors, method
+                    )
+                    cohort[method][estimator] = {
+                        "pairs": pairs, "raw": raw, "core": core,
+                        "weighted_core": weighted,
+                    }
+                except RuntimeError as exc:
+                    cohort[method][estimator] = {"unavailable": str(exc)}
+        result["cohorts"][name] = cohort
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("pad_root", type=Path, help="Pad-step3-rec.root")
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument(
+        "--bm-time-source", choices=("pad", "cluster"), default="pad",
+        help="pad: existing window timing; cluster: entire uniquely matched cluster",
+    )
     parser.add_argument(
         "--bm2-matched-pad-count",
         type=int,
@@ -600,6 +740,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.bm2_matched_pad_count < 0:
         parser.error("--bm2-matched-pad-count must be >= 0")
+    if args.bm_time_source == "cluster" and args.bm2_matched_pad_count != 0:
+        parser.error("cluster mode requires --bm2-matched-pad-count 0")
     active_detectors = tuple(
         name.strip() for name in args.detectors.split(",") if name.strip()
     )
@@ -612,51 +754,65 @@ def main() -> int:
     if "BM2" not in active_detectors:
         parser.error("--detectors must include BM2 for the BM2-Tracker plots")
     source = args.pad_root.resolve()
-    output = (args.output_dir or source.parent / "time_resolution").resolve()
+    default_output = source.parent / "time_resolution"
+    if args.bm_time_source == "cluster":
+        default_output /= "cluster"
+    output = (args.output_dir or default_output).resolve()
+    if args.bm_time_source == "cluster" and output == (source.parent / "time_resolution").resolve():
+        parser.error("cluster output must use a separate directory from single-pad results")
     output.mkdir(parents=True, exist_ok=True)
 
     records, availability, total_entries = read_events(
-        source, args.bm2_matched_pad_count
+        source, args.bm2_matched_pad_count, args.bm_time_source
     )
     if not records:
-        raise RuntimeError("BM2 matched-pad cut selected no events")
+        raise RuntimeError(f"BM2 {args.bm_time_source} timing selection accepted no events")
     active_indices = [DETECTORS.index(name) for name in active_detectors]
-    common_events = sum(
-        all(math.isfinite(float(record["mean"][index])) for index in active_indices)
-        for record in records
-    )
-    pair_rows: list[dict[str, object]] = []
-    solutions: dict[str, object] = {}
-    for estimator in ("mean", "min"):
-        rows, raw, core, weighted_core = analyze(
-            records, estimator, active_detectors
+    solutions_by_method: dict[str, dict[str, object]] = {}
+    gaussian_rows_by_method: dict[str, list[dict[str, object]]] = {}
+    common_events_by_method: dict[str, int] = {}
+    pair_rows_all: list[dict[str, object]] = []
+    detector_rows_all: list[tuple[object, ...]] = []
+    method_reports: dict[str, dict[str, object]] = {}
+    for method in TIMING_METHODS:
+        method_output = output if method == "t20" else output / method
+        method_output.mkdir(parents=True, exist_ok=True)
+        common_events_by_method[method] = sum(
+            all(math.isfinite(float(record[
+                "mean" if method == "t20" else f"mean_{method}"
+            ][index])) for index in active_indices)
+            for record in records
         )
-        pair_rows.extend(rows)
-        solutions[estimator] = {"raw": raw, "core": core, "weighted_core": weighted_core}
+        pair_rows: list[dict[str, object]] = []
+        solutions: dict[str, object] = {}
+        for estimator in ("mean", "min"):
+            rows, raw, core, weighted_core = analyze(
+                records, estimator, active_detectors, method
+            )
+            pair_rows.extend(rows)
+            solutions[estimator] = {
+                "raw": raw, "core": core, "weighted_core": weighted_core
+            }
+        solutions_by_method[method] = solutions
+        selection_label = (
+            f"BM2 cluster timing, sigmoid {method}"
+            if args.bm_time_source == "cluster"
+            else f"BM2 track-matched pad timing, sigmoid {method}"
+        )
+        gaussian_rows = plot_bm2_tracker_gaussians(
+            records, method_output, args.bm2_matched_pad_count,
+            selection_label, method,
+        )
+        gaussian_rows_by_method[method] = gaussian_rows
+        pair_rows_all.extend(pair_rows)
 
-    gaussian_rows = plot_bm2_tracker_gaussians(
-        records, output, args.bm2_matched_pad_count
-    )
-
-    with (output / "pairwise_time_resolution.tsv").open("w", newline="", encoding="utf-8") as stream:
-        fields = [
-            "estimator", "first", "second", "events", "mean_ns", "rms_ns",
-            "core_events", "core_mean_ns", "core_sigma_ns",
-        ]
-        writer = csv.DictWriter(stream, fieldnames=fields, delimiter="\t", extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(pair_rows)
-
-    with (output / "detector_time_resolution.tsv").open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.writer(stream, delimiter="\t")
-        writer.writerow(("estimator", "distribution", "detector", "variance_ns2",
-                         "resolution_ns", "resolution_uncertainty_ns"))
         for estimator in ("mean", "min"):
             for distribution in ("raw", "core", "weighted_core"):
                 result = solutions[estimator][distribution]
                 for index, detector in enumerate(active_detectors):
-                    writer.writerow(
+                    detector_rows_all.append(
                         (
+                            method,
                             estimator,
                             distribution,
                             detector,
@@ -668,11 +824,89 @@ def main() -> int:
                             )[index],
                         )
                     )
+        with (method_output / "pairwise_time_resolution.tsv").open(
+            "w", newline="", encoding="utf-8"
+        ) as stream:
+            fields = [
+                "estimator", "timing_method", "first", "second", "events",
+                "mean_ns", "rms_ns", "core_events", "core_mean_ns",
+                "core_sigma_ns",
+            ]
+            writer = csv.DictWriter(
+                stream, fieldnames=fields, delimiter="\t", extrasaction="ignore"
+            )
+            writer.writeheader()
+            writer.writerows(pair_rows)
 
-    report = {
+        method_report: dict[str, object] = {
+            "timing_method": method,
+            "fraction": int(method[1:]),
+            "bm_time_branches": [
+                f"{('bmClusterS' if args.bm_time_source == 'cluster' else 'bmS')}{'' if method == 't20' else method[1:]}_{field}"
+                for field in ("mean", "min", "n")
+            ],
+            "tracker_time_branches": [
+                f"trS{'' if method == 't20' else method[1:]}_{field}"
+                for field in ("mean", "min", "n")
+            ],
+            "selected_track_events": len(records),
+            "common_active_detector_events": common_events_by_method[method],
+            "detector_availability": availability,
+            "active_detectors": active_detectors,
+            "core_definition": "iterative 3-sigma clipping initialized by median/MAD",
+            "model": "Var(t_i-t_j)=sigma_i^2+sigma_j^2; unweighted LS over pair-specific cohorts",
+            "bm2_tracker_gaussian_fits": gaussian_rows,
+            "solutions": solutions,
+        }
+        method_reports[method] = method_report
+        with (method_output / "time_resolution.json").open(
+            "w", encoding="utf-8"
+        ) as stream:
+            json.dump(serializable(method_report), stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+
+    with (output / "pairwise_time_resolution.tsv").open(
+        "w", newline="", encoding="utf-8"
+    ) as stream:
+        fields = [
+            "estimator", "timing_method", "first", "second", "events",
+            "mean_ns", "rms_ns", "core_events", "core_mean_ns",
+            "core_sigma_ns",
+        ]
+        writer = csv.DictWriter(
+            stream, fieldnames=fields, delimiter="\t", extrasaction="ignore"
+        )
+        writer.writeheader()
+        writer.writerows(pair_rows_all)
+
+    with (output / "detector_time_resolution.tsv").open(
+        "w", newline="", encoding="utf-8"
+    ) as stream:
+        writer = csv.writer(stream, delimiter="\t")
+        writer.writerow(("timing_method", "estimator", "distribution", "detector",
+                         "variance_ns2", "resolution_ns", "resolution_uncertainty_ns"))
+        writer.writerows(detector_rows_all)
+
+    with (output / "cfd_fraction_resolution.tsv").open(
+        "w", newline="", encoding="utf-8"
+    ) as stream:
+        writer = csv.writer(stream, delimiter="\t")
+        writer.writerow(("timing_method", "fraction_percent", "estimator",
+                         "distribution", "detector", "variance_ns2",
+                         "resolution_ns", "resolution_uncertainty_ns"))
+        for method in TIMING_METHODS:
+            for row in detector_rows_all:
+                if row[0] == method:
+                    writer.writerow((method, int(method[1:]), *row[1:]))
+    plot_cfd_fraction_resolution(solutions_by_method, active_detectors, output)
+
+    t20_solutions = solutions_by_method["t20"]
+    t20_gaussian_rows = gaussian_rows_by_method["t20"]
+    report: dict[str, object] = {
         "input": str(source),
         "tree": "TrackArrivalEvents",
-        "timing": "sigmoid t20",
+        "timing": "sigmoid t20 (legacy primary); parallel CFD fractions t30/t40/t50",
+        "timing_methods": method_reports,
         "sample_ns": SAMPLE_NS,
         "tracker_time": "strip-count-weighted mean over available matched X/Y axes",
         "total_track_events": total_entries,
@@ -681,17 +915,40 @@ def main() -> int:
             "bm2_matched_pad_count": args.bm2_matched_pad_count,
             "branch": "bmS_n[1]",
             "scope": "track-centered 3x3 pad matching window",
-            "pad_time_requirement": "valid sigmoid t20",
+            "pad_time_requirement": "valid sigmoid fit; same event cohort used for t20/t30/t40/t50",
             "disabled_when": 0,
         },
         "detector_availability": availability,
         "active_detectors": active_detectors,
-        "common_events": common_events,
+        "common_events": common_events_by_method["t20"],
         "core_definition": "iterative 3-sigma clipping initialized by median/MAD",
         "model": "Var(t_i-t_j)=sigma_i^2+sigma_j^2; unweighted LS over pair-specific cohorts",
-        "bm2_tracker_gaussian_fits": gaussian_rows,
-        "solutions": solutions,
+        "bm2_tracker_gaussian_fits": t20_gaussian_rows,
+        "solutions": t20_solutions,
+        "cfd_fraction_comparison": {
+            "table": "cfd_fraction_resolution.tsv",
+            "plot": "cfd_fraction_resolution.png",
+        },
     }
+    if args.bm_time_source == "cluster":
+        report["timing_selection"] = {
+            "bm_time_source": "cluster",
+            "matched_cluster_count": 1,
+            "branch": "bm_matched_cluster_count[1]",
+            "time_branches": [
+                "bmClusterS_mean", "bmClusterS30_mean", "bmClusterS40_mean",
+                "bmClusterS50_mean",
+            ],
+            "association": "any cluster member intersects the track-centered 3x3 pad window",
+            "ambiguity": "count all spatial candidates, including clusters without valid time",
+            "time_scope": "all unique pads of the matched cluster, including outside the window",
+            "pad_time_requirement": "valid sigmoid fit; same event cohort used for t20/t30/t40/t50",
+            "mean_weighting": "equal weight per valid pad; largest maxA waveform per duplicate pad",
+            "unmatched_clusters": "excluded from event time",
+        }
+        report["single_pad_comparison"] = compare_with_single_pad(
+            source, records, active_detectors
+        )
     with (output / "time_resolution.json").open("w", encoding="utf-8") as stream:
         json.dump(serializable(report), stream, indent=2, ensure_ascii=False)
         stream.write("\n")
@@ -699,36 +956,23 @@ def main() -> int:
     print(f"input entries: {total_entries}")
     print(
         "selected entries: "
-        f"{len(records)} (BM2 matched pad count "
-        f"{'uncut' if args.bm2_matched_pad_count == 0 else args.bm2_matched_pad_count})"
+        f"{len(records)} (BM time source={args.bm_time_source}, "
+        f"pad count={'uncut' if args.bm2_matched_pad_count == 0 else args.bm2_matched_pad_count})"
     )
     print("availability: " + ", ".join(f"{name}={availability[name]}" for name in DETECTORS))
     print(
         "active-detector common cohort "
-        f"({','.join(active_detectors)}): {common_events}"
+        f"({','.join(active_detectors)}): {common_events_by_method['t20']}"
     )
-    for estimator in ("mean", "min"):
-        print(f"{estimator} estimator, weighted-core per-detector resolution [ns]:")
-        result = solutions[estimator]["weighted_core"]
+    for method in TIMING_METHODS:
+        print(f"sigmoid {method} weighted-core resolution [ns]:")
+        result = solutions_by_method[method]["mean"]["weighted_core"]
         for index, (name, resolution) in enumerate(
             zip(active_detectors, result["resolutions_ns"])
         ):
             uncertainty = result["resolution_uncertainties_ns"][index]
             print(f"  {name}: {resolution:.6g} +/- {uncertainty:.3g}"
                   if math.isfinite(resolution) else f"  {name}: invalid")
-        print(
-            "  pair-variance model residual RMS [ns^2]: "
-            f"{result['pair_variance_residual_rms_ns2']:.6g}"
-        )
-    print("BM2-Tracker Gaussian fits:")
-    for row in gaussian_rows:
-        print(
-            f"  {row['first']}-{row['second']}: "
-            f"mu={row['gaussian_mu_ns']:.6g} +/- "
-            f"{row['gaussian_mu_error_ns']:.3g} ns, "
-            f"sigma={row['gaussian_sigma_ns']:.6g} +/- "
-            f"{row['gaussian_sigma_error_ns']:.3g} ns"
-        )
     print(f"wrote {output}")
     return 0
 

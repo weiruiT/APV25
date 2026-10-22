@@ -29,7 +29,7 @@ DecodedAPVRoot2TrackRaw
   -> TrackRaw：slot 映射、trigger 展宽、多文件连续事件号、时间戳
 AnalysisAPV
   -> TrackX0/Y0、TrackX1/Y1、TrackX2/Y2、BMPadSignals
-  -> pedestal=0；保留波形形状、单峰和 sigmoid t20 条件
+  -> pedestal=0；保留波形形状、单峰条件，并从一次 sigmoid 拟合计算 t20/t30/t40/t50
 DecodeAPV
   -> Track0、Track1、Track2：按六个 Tracker 方向的 event 并集压缩，重建 strip cluster 和二维 hit
   -> 显式 entry=1..N 在三棵树中同步；event 保留原始 DAQ trigger 编号
@@ -39,9 +39,18 @@ ReconstructTrack
 PadReconstruction
   -> BM1Events、BM2Events、TrackArrivalEvents：独立 BM 事件表和径迹匹配时间
 analyze_time_resolution.py
-  -> 默认选择 bmS_n[1]==1：BM2 的径迹中心 3×3 窗口内恰好一个有效时间 pad
-  -> BM2−Tracker1/2/3 时间差核心选择和高斯拟合
+  -> 相同事件 cut 下并行分析 sigmoid t20/t30/t40/t50；默认选择 bmS_n[1]==1
+  -> BM2 的径迹中心 3×3 窗口内恰好一个有效 sigmoid pad
+analyze_time_resolution.py --bm-time-source cluster（独立的 cluster_timing 阶段）
+  -> 唯一匹配的空间 cluster，允许多个 pad，使用完整 cluster 的有效时间
+  -> Combine/time_resolution/cluster/<execution_id>/；原单 pad 输出继续保留
+  -> 每种恒比时刻各自的 BM2−Tracker 时间差分布、核心选择、高斯拟合和时间分辨
   -> `timing_cuts.detectors` 中实际接入探测器的两两方差联合解与逐探测器时间分辨
+`scripts/analyze_bm_snr_timing.py`（默认启用，可由 `snr_timing.enabled` 关闭）
+  -> 用 Step2 的 maxA / peak_noise_rms 为实际匹配到的 BM2 pad 计算 SNR
+  -> 按 `snr_timing.bin_edges` 对 BM2+三层 Tracker 的时间样本分组并解方差
+`scripts/export_bm_snr_intermediates.py`
+  -> 导出每组六个探测器对的 Δt 分布、核心筛选过程、Gaussian 诊断拟合和方差方程
 ```
 
 输出在 `run/Combine/`：
@@ -60,7 +69,13 @@ time_resolution/
 ├── bm2_tracker_gaussian_fits.tsv
 ├── pairwise_time_resolution.tsv
 ├── detector_time_resolution.tsv
-└── time_resolution.json
+├── cfd_fraction_resolution.tsv/.png/.pdf
+├── time_resolution.json
+├── t30/、t40/、t50/（各比例的两两分布、拟合和时间分辨）
+└── snr_binned/<execution_id>/
+    ├── snr_bins.tsv
+    ├── snr_timing_comparison.png/.pdf
+    └── pairwise_details/（各 SNR 区间的图、逐事件表和方差解）
 ```
 
 ### Step4 对齐、几何接受区和残差统计
@@ -93,7 +108,7 @@ BM-noise-channel-parameters.txt
 noise-global-parameters-1778.txt/.root
 ```
 
-1778 = 3 × 2 × 256 个 Tracker strip + 2 × 121 个有效 pad。noise 结果只用于噪声研究，不参与当前预处理宇宙线信号的二次基线扣除。旧 `.dat` 解包入口已删除。
+1778 = 3 × 2 × 256 个 Tracker strip + 2 × 121 个有效 pad。noise 标定用于噪声研究，其逐通道 sigma 还用于 Step2 显著峰最低高度；不参与当前预处理宇宙线信号的二次基线扣除或通道级 3σ 筛选。旧 `.dat` 解包入口已删除。
 
 ## 配置和可追溯性
 

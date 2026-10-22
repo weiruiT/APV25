@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -16,6 +17,9 @@ import subprocess
 import sys
 import tempfile
 import uuid
+
+from export_run import export as export_results
+from run_status import write_status_index
 
 PROJECT = Path(__file__).resolve().parents[1]
 MODES = ("signal", "noise", "all", "amplitude", "energy", "arrival")
@@ -32,6 +36,9 @@ TIMING_FILES = [
     "time_resolution/BM2_Tracker1_gaussian_fit.png",
     "time_resolution/BM2_Tracker2_gaussian_fit.png",
     "time_resolution/BM2_Tracker3_gaussian_fit.png",
+    "time_resolution/cfd_fraction_resolution.tsv",
+    "time_resolution/cfd_fraction_resolution.png",
+    "time_resolution/cfd_fraction_resolution.pdf",
 ]
 
 
@@ -203,6 +210,53 @@ def run_stage(command, cwd, logfile):
     return result.returncode if result.returncode else (1 if fatal else 0)
 
 
+def run_cluster_timing(run, execution, manifest, args, timing_detectors):
+    """Additional cluster analysis; existing single-pad outputs stay separate."""
+    stage = {"status": "running", "log": "cluster_timing.log"}
+    manifest["stages"]["cluster_timing"] = stage
+    write_json(execution / "manifest.json", manifest)
+    try:
+        stage["fingerprint"] = object_hash({
+            "signal_fingerprint": manifest["stages"]["signal"]["fingerprint"],
+            "detectors": timing_detectors,
+            "mode": "unique_matched_cluster_v1",
+        })
+        previous = (successful_previous(run, "cluster_timing", stage["fingerprint"])
+                    if args.force == 0 else None)
+        if previous:
+            stage.update(reused_execution=previous["execution_id"], exit_code=0,
+                         outputs=previous["stages"]["cluster_timing"]["outputs"])
+            (execution / stage["log"]).write_text(
+                f"Verified and reused {previous['execution_id']}\n")
+        else:
+            output = run / "Combine/time_resolution/cluster" / execution.name
+            stage["exit_code"] = run_stage(
+                [os.environ.get("BTTRACKER_PYTHON", sys.executable),
+                 str(PROJECT / "scripts/analyze_time_resolution.py"),
+                 str(run / "Combine/Pad-step3-rec.root"),
+                 "--output-dir", str(output), "--bm-time-source", "cluster",
+                 "--detectors", ",".join(timing_detectors)],
+                execution, execution / stage["log"])
+            if stage["exit_code"] != 0:
+                raise RuntimeError("cluster timing failed; see cluster_timing.log")
+            files = [output / Path(name).name for name in TIMING_FILES]
+            files += sorted(
+                path for method in ("t30", "t40", "t50")
+                for path in (output / method).rglob("*") if path.is_file()
+            )
+            missing = [str(path) for path in files if not path.is_file()]
+            if missing:
+                raise RuntimeError("cluster timing output is incomplete: " + ", ".join(missing))
+            stage["outputs"] = {str(path.relative_to(run)): digest(path) for path in files}
+        stage["status"] = "completed"
+        manifest["outputs"].update(stage["outputs"])
+        print(f"[{run.name}] cluster_timing: completed", flush=True)
+    except Exception as exc:
+        stage.update(status="failed", error=str(exc))
+        print(f"[{run.name}] cluster_timing: {exc}", file=sys.stderr, flush=True)
+    write_json(execution / "manifest.json", manifest)
+
+
 def execute_run(run, args, executable, source_hash):
     result = {"run": str(run), "status": "failed", "execution_id": None}
     try:
@@ -258,6 +312,30 @@ def execute_run(run, args, executable, source_hash):
                         "timing_cuts.detectors must contain BM2 and at least "
                         "two other unique known detectors"
                     )
+                cluster_config = analysis_config.get("cluster_timing", {})
+                if not isinstance(cluster_config, dict):
+                    raise ValueError("cluster_timing must be an object")
+                cluster_timing_enabled = cluster_config.get("enabled", False)
+                if not isinstance(cluster_timing_enabled, bool):
+                    raise ValueError("cluster_timing.enabled must be a boolean")
+                snr_config = analysis_config.get("snr_timing", {})
+                if not isinstance(snr_config, dict):
+                    raise ValueError("snr_timing must be an object")
+                snr_timing_enabled = snr_config.get("enabled", False)
+                if not isinstance(snr_timing_enabled, bool):
+                    raise ValueError("snr_timing.enabled must be a boolean")
+                snr_bin_edges = snr_config.get("bin_edges", [15, 25, 40, 60, 90])
+                if snr_timing_enabled:
+                    if (not isinstance(snr_bin_edges, list) or len(snr_bin_edges) < 2
+                            or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                                   or not math.isfinite(value) or value < 0
+                                   for value in snr_bin_edges)
+                            or any(second <= first for first, second in
+                                   zip(snr_bin_edges, snr_bin_edges[1:]))):
+                        raise ValueError(
+                            "snr_timing.bin_edges must be an increasing list of "
+                            "non-negative finite numbers"
+                        )
                 (run / "Combine").mkdir(exist_ok=True)
                 if args.alignment_source:
                     source = Path(args.alignment_source).resolve(strict=True)
@@ -338,6 +416,12 @@ def execute_run(run, args, executable, source_hash):
                                     + ", ".join(missing_timing)
                                 )
                             files += timing_files
+                            time_output = run / "Combine/time_resolution"
+                            files += sorted(
+                                path for method in ("t30", "t40", "t50")
+                                for path in (time_output / method).rglob("*")
+                                if path.is_file()
+                            )
                             files += sorted((run / "Combine").glob("MMalignmentPar*.dat"))
                         stage["outputs"] = {str(p.relative_to(run)): digest(p) for p in files}
                         stage["status"] = "completed"
@@ -346,6 +430,98 @@ def execute_run(run, args, executable, source_hash):
                     except Exception as exc:
                         stage.update(status="failed", error=str(exc))
                         print(f"[{run.name}] {mode}: {exc}", file=sys.stderr, flush=True)
+                    write_json(manifest_path, manifest)
+                if (cluster_timing_enabled and "signal" in modes and
+                        manifest["stages"].get("signal", {}).get("status") == "completed"):
+                    run_cluster_timing(run, execution, manifest, args, timing_detectors)
+                if (snr_timing_enabled and "signal" in modes and
+                        manifest["stages"].get("signal", {}).get("status") == "completed"):
+                    print(f"[{run.name}] snr_timing: starting ({execution_id})", flush=True)
+                    snr_stage = {"status": "running", "log": "snr_timing.log",
+                                 "intermediates_log": "snr_intermediates.log",
+                                 "bin_edges": snr_bin_edges}
+                    manifest["stages"]["snr_timing"] = snr_stage
+                    write_json(manifest_path, manifest)
+                    edge_argument = ",".join(format(float(value), ".15g")
+                                              for value in snr_bin_edges)
+                    analysis_script = PROJECT / "scripts/analyze_bm_snr_timing.py"
+                    export_script = PROJECT / "scripts/export_bm_snr_intermediates.py"
+                    try:
+                        snr_stage["fingerprint"] = object_hash({
+                            "signal_fingerprint": manifest["stages"]["signal"].get("fingerprint"),
+                            "bin_edges": snr_bin_edges,
+                            "analysis_script_sha256": digest(analysis_script),
+                            "export_script_sha256": digest(export_script),
+                        })
+                        previous_snr = (successful_previous(
+                            run, "snr_timing", snr_stage["fingerprint"]
+                        ) if args.force == 0 else None)
+                        if previous_snr:
+                            previous_stage = previous_snr["stages"]["snr_timing"]
+                            snr_stage.update(
+                                status="completed", exit_code=0,
+                                intermediates_exit_code=0,
+                                reused_execution=previous_snr["execution_id"],
+                                outputs=previous_stage["outputs"],
+                            )
+                            (execution / "snr_timing.log").write_text(
+                                f"Verified and reused {previous_snr['execution_id']}\n"
+                            )
+                            (execution / "snr_intermediates.log").write_text(
+                                f"Verified and reused {previous_snr['execution_id']}\n"
+                            )
+                        else:
+                            diagnostic_dir = run / "Combine/time_resolution/snr_binned" / execution_id
+                            details_dir = diagnostic_dir / "pairwise_details"
+                            diagnostic_dir.parent.mkdir(parents=True, exist_ok=True)
+                            snr_stage["exit_code"] = run_stage(
+                                [os.environ.get("BTTRACKER_PYTHON", sys.executable),
+                                 str(analysis_script), str(run), "--output-dir",
+                                 str(diagnostic_dir), "--snr-bin-edges", edge_argument],
+                                execution, execution / "snr_timing.log")
+                            if snr_stage["exit_code"] != 0:
+                                raise RuntimeError(
+                                    "SNR-binned timing analysis failed with exit "
+                                    f"{snr_stage['exit_code']}; see {execution / 'snr_timing.log'}"
+                                )
+                            snr_stage["intermediates_exit_code"] = run_stage(
+                                [os.environ.get("BTTRACKER_PYTHON", sys.executable),
+                                 str(export_script), str(diagnostic_dir), "--output-dir",
+                                 str(details_dir), "--snr-bin-edges", edge_argument,
+                                 "--single-run", run.name],
+                                execution, execution / "snr_intermediates.log")
+                            if snr_stage["intermediates_exit_code"] != 0:
+                                raise RuntimeError(
+                                    "SNR time-difference export failed with exit "
+                                    f"{snr_stage['intermediates_exit_code']}; see "
+                                    f"{execution / 'snr_intermediates.log'}"
+                                )
+                            required_snr_files = [
+                                diagnostic_dir / "snr_bins.tsv",
+                                diagnostic_dir / "snr_timing_report.json",
+                                diagnostic_dir / "snr_timing_comparison.png",
+                                diagnostic_dir / "snr_timing_plots.root",
+                                details_dir / "README.md",
+                                details_dir / "summary.tsv",
+                                details_dir / "provenance.json",
+                            ]
+                            missing_snr = [str(path) for path in required_snr_files
+                                           if not path.is_file()]
+                            if missing_snr:
+                                raise RuntimeError("SNR timing output is incomplete: "
+                                                   + ", ".join(missing_snr))
+                            snr_outputs = sorted(path for path in diagnostic_dir.rglob("*")
+                                                 if path.is_file())
+                            snr_stage["outputs"] = {
+                                str(path.relative_to(run)): digest(path)
+                                for path in snr_outputs
+                            }
+                        snr_stage.update(status="completed")
+                        manifest["outputs"].update(snr_stage["outputs"])
+                        print(f"[{run.name}] snr_timing: completed", flush=True)
+                    except Exception as exc:
+                        snr_stage.update(status="failed", error=str(exc))
+                        print(f"[{run.name}] snr_timing: {exc}", file=sys.stderr, flush=True)
                     write_json(manifest_path, manifest)
                 if args.plots and manifest["stages"].get("signal", {}).get("status") == "completed":
                     macro = PROJECT.parent / "debug/macros/plot_peak_timing.sh"
@@ -371,6 +547,32 @@ def execute_run(run, args, executable, source_hash):
             for mode in ("signal", "noise"):
                 if manifest["stages"].get(mode, {}).get("status") == "completed":
                     write_json(run / "metadata" / f"latest_{mode}.json", {"execution_id": execution_id})
+            for mode in ("snr_timing", "cluster_timing"):
+                if manifest["stages"].get(mode, {}).get("status") == "completed":
+                    write_json(run / "metadata" / f"latest_{mode}.json",
+                               {"execution_id": execution_id})
+            # Publish only after every requested stage has succeeded. Use this
+            # exact execution, including its own cluster/SNR outputs, so an old
+            # latest_* pointer cannot introduce results from another analysis.
+            if (manifest["status"] == "completed" and
+                    manifest["stages"].get("signal", {}).get("status") == "completed"):
+                try:
+                    destination = export_results(run, execution_id,
+                                                 execution_id=execution_id)
+                    manifest["result_export"] = {
+                        "status": "completed", "directory": str(destination)}
+                    write_json(run / "metadata/latest_results.json", {
+                        "execution_id": execution_id,
+                        "directory": str(destination.relative_to(run)),
+                    })
+                    result["results"] = str(destination)
+                except Exception as exc:
+                    manifest["status"] = "partial_failed"
+                    manifest["result_export"] = {"status": "failed", "error": str(exc)}
+                    result["error"] = f"result export failed: {exc}"
+                    print(f"[{run.name}] result export failed: {exc}",
+                          file=sys.stderr, flush=True)
+                write_json(manifest_path, manifest)
             result.update(status=manifest["status"], manifest=str(manifest_path),
                           stages=manifest["stages"])
             if "error" in manifest:
@@ -452,6 +654,8 @@ def init_run(args):
     write_json(run_record_path, run_record)
     action = "Updated" if existing else "Created"
     print(f"{action} {run}; imported {len(records)} files ({'copy' if args.copy else 'symlink'})")
+    if run.parent.is_dir() and run.parent.name == "batches":
+        print(f"Run status index: {write_status_index(run.parent)}")
     return 0
 
 
@@ -520,6 +724,9 @@ def main(argv=None):
         results.sort(key=lambda r: r["run"])
         (summary_dir / "summary.tsv").write_text("run\tstatus\texecution_id\n" + "".join(
             f"{r['run']}\t{r['status']}\t{r.get('execution_id') or ''}\n" for r in results))
+        index_root = summary_base.parent if (summary_base / "metadata/run.json").is_file() else summary_base
+        if index_root.is_dir():
+            print(f"Run status index: {write_status_index(index_root)}")
         print(f"Batch summary: {summary_dir / 'summary.tsv'}")
         return 0 if all(r["status"] == "completed" for r in results) else 1
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:

@@ -2,11 +2,13 @@ from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import json
 from pathlib import Path
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 spec = importlib.util.spec_from_file_location(
     "run_manager", Path(__file__).resolve().parents[1] / "scripts/run_manager.py")
 manager = importlib.util.module_from_spec(spec)
@@ -31,10 +33,28 @@ class RunManagerTests(unittest.TestCase):
             "output = pathlib.Path(sys.argv[sys.argv.index('--output-dir') + 1])\n"
             f"names = {manager.TIMING_FILES!r}\n"
             "for name in names:\n"
-            "    path = output.parent / name\n"
+            "    path = output / pathlib.Path(name).name\n"
             "    path.parent.mkdir(parents=True, exist_ok=True)\n"
             "    path.write_text('TIMING')\n"
             "print('TIMING_ARGS=' + ' '.join(sys.argv[1:]))\n"
+        )
+        scripts = self.project / "scripts"
+        (scripts / "analyze_bm_snr_timing.py").write_text(
+            "import pathlib, sys\n"
+            "output = pathlib.Path(sys.argv[sys.argv.index('--output-dir') + 1])\n"
+            "output.mkdir(parents=True, exist_ok=False)\n"
+            "for name in ('snr_bins.tsv','snr_timing_report.json',"
+            "'snr_timing_comparison.png','snr_timing_plots.root'):\n"
+            "    (output / name).write_text('SNR')\n"
+            "print('SNR_ARGS=' + ' '.join(sys.argv[1:]))\n"
+        )
+        (scripts / "export_bm_snr_intermediates.py").write_text(
+            "import pathlib, sys\n"
+            "output = pathlib.Path(sys.argv[sys.argv.index('--output-dir') + 1])\n"
+            "output.mkdir(parents=True, exist_ok=False)\n"
+            "for name in ('README.md','summary.tsv','provenance.json'):\n"
+            "    (output / name).write_text('DETAILS')\n"
+            "print('DETAILS_ARGS=' + ' '.join(sys.argv[1:]))\n"
         )
         self.executable = self.root / "fake_tracker.py"
         self.executable.write_text('''#!/usr/bin/env python3
@@ -101,6 +121,154 @@ for name in names: (output / name).write_text(value)
         self.assertIn(
             "--detectors BM2,Tracker1,Tracker2,Tracker3", timing_log
         )
+
+    def test_success_automatically_publishes_final_timing_only(self):
+        run = self.make_run("run_results")
+        first = self.execute(run)
+        self.assertEqual(first["status"], "completed", first)
+        published = run / "Results" / first["execution_id"]
+        self.assertEqual(first["results"], str(published))
+        self.assertTrue((published / "timing/time_resolution/detector_time_resolution.tsv").is_file())
+        self.assertFalse(list(published.rglob("*.root")))
+        self.assertFalse(list(published.rglob("*gaussian_fit*")))
+        self.assertTrue((run / "Combine/Tracker-step1-raw.root").is_file())
+        self.assertTrue((run / "Combine/time_resolution/BM2_Tracker1_gaussian_fit.png").is_file())
+        second = self.execute(run, force=0)
+        self.assertEqual(second["status"], "completed", second)
+        self.assertNotEqual(first["results"], second["results"])
+        self.assertTrue(published.is_dir())
+        latest = json.loads((run / "metadata/latest_results.json").read_text())
+        self.assertEqual(latest["execution_id"], second["execution_id"])
+
+    def test_noise_only_does_not_publish_timing(self):
+        run = self.make_run("run_noise_only")
+        result = self.execute(run, mode="noise")
+        self.assertEqual(result["status"], "completed", result)
+        self.assertFalse((run / "metadata/latest_results.json").exists())
+        self.assertFalse((run / "Results").exists())
+
+    def test_signal_only_does_not_publish_previous_snr_results(self):
+        run = self.make_run("run_snr_disabled")
+        override = run / "config/configCR.json"
+        override.write_text('{"snr_timing":{"enabled":true}}')
+        first = self.execute(run)
+        self.assertEqual(first["status"], "completed", first)
+        self.assertTrue(list(Path(first["results"]).rglob("snr_bins.tsv")))
+        override.write_text('{"snr_timing":{"enabled":false}}')
+        second = self.execute(run, mode="signal")
+        self.assertEqual(second["status"], "completed", second)
+        self.assertFalse(list(Path(second["results"]).rglob("snr_bins.tsv")))
+        self.assertTrue(list((run / "Combine").rglob("snr_bins.tsv")))
+
+    def test_export_failure_is_reported_without_losing_analysis(self):
+        run = self.make_run("run_export_failure")
+        with patch.object(manager, "export_results", side_effect=OSError("disk full")):
+            result = self.execute(run)
+        self.assertEqual(result["status"], "partial_failed")
+        self.assertIn("disk full", result["error"])
+        self.assertEqual(result["stages"]["signal"]["status"], "completed")
+        self.assertTrue((run / "metadata/latest_signal.json").is_file())
+        self.assertFalse((run / "metadata/latest_results.json").exists())
+
+    def test_cluster_timing_is_additive_and_reusable(self):
+        run = self.make_run("run_cluster")
+        (run / "config/configCR.json").write_text(
+            '{"cluster_timing":{"enabled":true},'
+            '"timing_cuts":{"bm2_matched_pad_count":1,'
+            '"detectors":["BM2","Tracker1","Tracker2","Tracker3"]}}')
+        result = self.execute(run)
+        self.assertEqual(result["status"], "completed", result)
+        stage = result["stages"]["cluster_timing"]
+        self.assertEqual(stage["status"], "completed")
+        execution = run / "metadata/executions" / result["execution_id"]
+        log = (execution / "cluster_timing.log").read_text()
+        self.assertIn("--bm-time-source cluster", log)
+        self.assertNotIn("--bm2-matched-pad-count", log)
+        self.assertIn("--bm2-matched-pad-count 1", (execution / "timing.log").read_text())
+        self.assertTrue(all("time_resolution/cluster/" in name for name in stage["outputs"]))
+        self.assertTrue((run / "Combine/time_resolution/time_resolution.json").is_file())
+        self.assertTrue((run / "metadata/latest_cluster_timing.json").is_file())
+        again = self.execute(run, force=0)
+        self.assertEqual(again["status"], "completed", again)
+        self.assertEqual(again["stages"]["cluster_timing"]["reused_execution"],
+                         result["execution_id"])
+
+    def test_cluster_timing_failure_preserves_single_pad_stage(self):
+        run = self.make_run("run_cluster_failure")
+        (run / "config/configCR.json").write_text('{"cluster_timing":{"enabled":true}}')
+        original = manager.run_stage
+
+        def fail_cluster(command, cwd, logfile):
+            if "--bm-time-source" in command:
+                logfile.write_text("Cluster analysis failure\n")
+                return 9
+            return original(command, cwd, logfile)
+
+        with patch.object(manager, "run_stage", side_effect=fail_cluster):
+            result = self.execute(run)
+        self.assertEqual(result["status"], "partial_failed")
+        self.assertEqual(result["stages"]["signal"]["status"], "completed")
+        self.assertEqual(result["stages"]["cluster_timing"]["status"], "failed")
+        self.assertTrue((run / "metadata/latest_signal.json").is_file())
+        self.assertFalse((run / "metadata/latest_cluster_timing.json").exists())
+        self.assertFalse((run / "metadata/latest_results.json").exists())
+        self.assertFalse((run / "Results").exists())
+
+    def test_snr_grouped_timing_is_a_separate_manifest_stage(self):
+        run = self.make_run("run_snr")
+        (run / "config/configCR.json").write_text(
+            '{"snr_timing":{"enabled":true,"bin_edges":[15,25,40,60,90]}}')
+
+        def fake_stage(command, _cwd, logfile):
+            logfile.write_text("ARGS=" + " ".join(command[1:]) + "\n")
+            executable = Path(command[0]) == self.executable
+            script_name = Path(command[1]).name if not executable else ""
+            if executable:
+                mode = command[3]
+                output = run / ("Combine/noise" if mode == "noise" else "Combine")
+                names = (manager.expected_outputs(run, "signal") if mode == "signal" else [
+                    output / "noise-global-parameters-1778.txt",
+                    output / "noise-global-parameters-1778.root",
+                ])
+                for path in names:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(mode)
+            elif script_name == "analyze_time_resolution.py":
+                for relative in manager.TIMING_FILES:
+                    path = run / "Combine" / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("TIMING")
+            else:
+                output = Path(command[command.index("--output-dir") + 1])
+                output.mkdir(parents=True, exist_ok=False)
+                names = (("snr_bins.tsv", "snr_timing_report.json",
+                          "snr_timing_comparison.png", "snr_timing_plots.root")
+                         if script_name == "analyze_bm_snr_timing.py"
+                         else ("README.md", "summary.tsv", "provenance.json"))
+                for name in names:
+                    (output / name).write_text("SNR")
+            return 0
+
+        with patch.object(manager, "run_stage", side_effect=fake_stage):
+            result = self.execute(run, mode="all")
+        self.assertEqual(result["status"], "completed")
+        stage = result["stages"]["snr_timing"]
+        self.assertEqual(stage["status"], "completed")
+        self.assertEqual(stage["bin_edges"], [15, 25, 40, 60, 90])
+        self.assertTrue(any(Path(name).name == "README.md" and
+                            "pairwise_details" in Path(name).parts
+                            for name in stage["outputs"]))
+        execution = run / "metadata/executions" / result["execution_id"]
+        self.assertIn("--snr-bin-edges 15,25,40,60,90",
+                      (execution / "snr_timing.log").read_text())
+        self.assertIn("--snr-bin-edges 15,25,40,60,90",
+                      (execution / "snr_intermediates.log").read_text())
+        self.assertIn("--single-run run_snr",
+                      (execution / "snr_intermediates.log").read_text())
+        second = self.execute(run, force=0, mode="all")
+        self.assertEqual(second["status"], "completed")
+        self.assertEqual(second["stages"]["snr_timing"]["reused_execution"],
+                         result["execution_id"])
 
     def test_missing_noise_blocks_signal_peak_selection(self):
         run = self.make_run("run_missing", noise=False)

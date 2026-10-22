@@ -37,6 +37,11 @@ def quantile(values, fraction):
     return values[lo] + (values[hi] - values[lo]) * (index - lo)
 
 
+def finite_mean(values):
+    values = [value for value in values if math.isfinite(value)]
+    return statistics.fmean(values) if values else math.nan
+
+
 def describe(values):
     values = [v for v in values if math.isfinite(v)]
     return {"n": len(values), "mean": statistics.fmean(values) if values else math.nan,
@@ -145,10 +150,11 @@ def timing_summary(records):
               "bm2_sigma_error_ns": math.nan, "model_chi2": math.nan,
               "model_ndf": 2, "minimum_pair_events": 0, "error": ""}
     try:
-        pairs, _raw, _core, weighted = analyze(records, "mean", ACTIVE)
-        result.update(bm2_sigma_ns=weighted["resolutions_ns"][0],
-                      bm2_sigma_error_ns=weighted["resolution_uncertainties_ns"][0],
-                      model_chi2=weighted["chi2"],
+        # The fourth return value is the production weighted_core solution.
+        pairs, _raw, _core, weighted_core = analyze(records, "mean", ACTIVE)
+        result.update(bm2_sigma_ns=weighted_core["resolutions_ns"][0],
+                      bm2_sigma_error_ns=weighted_core["resolution_uncertainties_ns"][0],
+                      model_chi2=weighted_core["chi2"],
                       minimum_pair_events=min(r["events"] for r in pairs))
         for row in pairs:
             key = row["first"] + "_" + row["second"]
@@ -160,18 +166,21 @@ def timing_summary(records):
     return result
 
 
-def bin_rows(run_name, events):
+def bin_rows(run_name, events, edges=BINS):
     rows = []
-    for low, high in zip(BINS, BINS[1:]):
+    for low, high in zip(edges, edges[1:]):
         selected = [r for r in events if low <= r["snr"] < high]
         if len(selected) < 40:
             continue
         row = {"run": run_name, "snr_low": low, "snr_high": high,
                "snr_median": quantile([r["snr"] for r in selected], .5),
+               "snr_mean": finite_mean([r["snr"] for r in selected]),
                "amplitude_median_adc": quantile([r["maxA"] for r in selected], .5),
                "noise_median_adc": quantile([r["peak_noise_rms"] for r in selected], .5),
                "jitter20_proxy_median_ns": quantile([r["jitter20_proxy_ns"] for r in selected], .5),
+               "jitter20_proxy_mean_ns": finite_mean([r["jitter20_proxy_ns"] for r in selected]),
                "rise10_90_median_ns": quantile([r["sigmoid_rise10_90_ns"] for r in selected], .5),
+               "rise10_90_mean_ns": finite_mean([r["sigmoid_rise10_90_ns"] for r in selected]),
                "fit_residual_over_noise_median": quantile([r["fit_residual_over_noise"] for r in selected], .5)}
         row.update(timing_summary(selected))
         common = timing_summary([r for r in selected if r["all_four_valid"]])
@@ -204,8 +213,59 @@ def add_hist(pad, name, title, cohorts, field, bins, low, high, objects):
     legend.Draw(); objects.extend(histograms + [legend])
 
 
-def add_graph(pad, name, title, rows, xfield, yfield, errorfield, objects):
+def add_snr_event_counts(pad, rows, objects):
+    """Show the matched timing-cohort event count in each configured SNR bin."""
+    pad.cd()
+    intervals = sorted({(float(row["snr_low"]), float(row["snr_high"])) for row in rows})
+    if not intervals:
+        label = ROOT.TLatex()
+        label.SetNDC(True); label.SetTextAlign(22); label.SetTextSize(.045)
+        label.DrawLatex(.5, .5, "No eligible SNR intervals")
+        objects.append(label)
+        return
+
+    labels = [f"[{low:g},{high:g})" for low, high in intervals]
+    frame = ROOT.TH1D("snr_event_counts_frame",
+                      "BM2 timing events by SNR interval;SNR interval;Events",
+                      len(intervals), .5, len(intervals) + .5)
+    frame.SetStats(0)
+    frame.SetMinimum(0.)
+    maximum = max(float(row.get("selected_events", 0)) for row in rows)
+    frame.SetMaximum(max(1., maximum * 1.22))
+    frame.GetXaxis().SetLabelSize(.065)
+    for index, label_text in enumerate(labels, 1):
+        frame.GetXaxis().SetBinLabel(index, label_text)
+    frame.Draw("AXIS")
+    objects.append(frame)
+
+    legend = ROOT.TLegend(.65, .75, .89, .89)
+    legend.SetBorderSize(0); legend.SetFillStyle(0)
+    runs = list(dict.fromkeys(row["run"] for row in rows))
+    for run_index, run in enumerate(runs):
+        hist = ROOT.TH1D(f"snr_event_counts_{run}", "", len(intervals), .5, len(intervals) + .5)
+        hist.SetStats(0)
+        for index, label_text in enumerate(labels, 1):
+            hist.GetXaxis().SetBinLabel(index, label_text)
+        for row in rows:
+            if row["run"] != run:
+                continue
+            interval = (float(row["snr_low"]), float(row["snr_high"]))
+            hist.SetBinContent(intervals.index(interval) + 1, int(row.get("selected_events", 0)))
+        color = COLORS[run_index % len(COLORS)]
+        hist.SetLineColor(color); hist.SetFillColorAlpha(color, .30); hist.SetLineWidth(2)
+        hist.SetBarWidth(.82); hist.SetBarOffset(.09)
+        hist.Draw("BAR SAME")
+        legend.AddEntry(hist, run, "f")
+        objects.append(hist)
+    if len(runs) > 1:
+        legend.Draw(); objects.append(legend)
+
+
+def add_graph(pad, name, title, rows, xfield, yfield, errorfield, objects,
+              left_margin=None, y_title_offset=1.2):
     pad.cd(); pad.SetGrid()
+    if left_margin is not None:
+        pad.SetLeftMargin(left_margin)
     multigraph = ROOT.TMultiGraph(name, title)
     legend = ROOT.TLegend(.62, .69, .89, .88)
     legend.SetBorderSize(0); legend.SetFillStyle(0)
@@ -221,31 +281,122 @@ def add_graph(pad, name, title, rows, xfield, yfield, errorfield, objects):
             error = row.get(errorfield, 0.) if errorfield else 0.
             graph.SetPointError(i, 0., error if math.isfinite(error) else 0.)
         multigraph.Add(graph, "LP"); legend.AddEntry(graph, run, "lp"); objects.append(graph)
-    multigraph.Draw("A"); legend.Draw(); objects.extend([multigraph, legend])
+    multigraph.Draw("A")
+    multigraph.GetYaxis().SetTitleOffset(y_title_offset)
+    legend.Draw(); objects.extend([multigraph, legend])
 
 
-def make_plots(output, all_pads, joined, bins, thresholds):
+def add_interval_graph(pad, name, title, rows, yfield, errorfield, objects,
+                       interval_fraction=False, cohort_totals=None):
+    """Plot each configured SNR interval at a categorical x position."""
+    pad.cd(); pad.SetGrid()
+    intervals = sorted({(float(row["snr_low"]), float(row["snr_high"])) for row in rows})
+    if not intervals:
+        label = ROOT.TLatex()
+        label.SetNDC(True); label.SetTextAlign(22); label.SetTextSize(.045)
+        label.DrawLatex(.5, .5, "No eligible SNR intervals")
+        objects.append(label)
+        return
+
+    labels = [f"[{low:g},{high:g})" for low, high in intervals]
+    values = []
+    for row in rows:
+        value = row.get(yfield, math.nan)
+        if interval_fraction:
+            denominator = interval_fraction.get(row["run"], 0)
+            value = row.get("selected_events", 0) / denominator if denominator else math.nan
+        if math.isfinite(value):
+            error = row.get(errorfield, 0.) if errorfield else 0.
+            values.append((value, error if math.isfinite(error) else 0.))
+
+    if interval_fraction:
+        ymin, ymax = 0., 1.05
+    elif values:
+        ymin = max(0., min(value - error for value, error in values) * .88)
+        ymax = max(value + error for value, error in values) * 1.18
+    else:
+        ymin, ymax = 0., 1.
+
+    frame = ROOT.TH1D(name + "_frame", title, len(labels), .5, len(labels) + .5)
+    frame.SetStats(0); frame.SetMinimum(ymin); frame.SetMaximum(ymax)
+    for index, label_text in enumerate(labels, 1):
+        frame.GetXaxis().SetBinLabel(index, label_text)
+    frame.GetXaxis().SetLabelSize(.035)
+    frame.Draw("AXIS")
+    objects.append(frame)
+
+    legend = ROOT.TLegend(.46, .72, .89, .89)
+    legend.SetBorderSize(0); legend.SetFillStyle(0)
+    legend.SetTextFont(42); legend.SetTextSize(.032)
+    runs = list(dict.fromkeys(row["run"] for row in rows))
+    has_graph = False
+    for run_index, run in enumerate(runs):
+        selected = [row for row in rows if row["run"] == run]
+        graph = ROOT.TGraphErrors()
+        graph.SetName(name + "_" + run)
+        graph.SetLineColor(COLORS[run_index % len(COLORS)])
+        graph.SetMarkerColor(COLORS[run_index % len(COLORS)])
+        graph.SetMarkerStyle(20 + run_index); graph.SetLineWidth(2)
+        point = 0
+        for row in selected:
+            value = row.get(yfield, math.nan)
+            if interval_fraction:
+                denominator = interval_fraction.get(run, 0)
+                value = row.get("selected_events", 0) / denominator if denominator else math.nan
+            if not math.isfinite(value):
+                continue
+            interval = (float(row["snr_low"]), float(row["snr_high"]))
+            x = intervals.index(interval) + 1
+            error = row.get(errorfield, 0.) if errorfield else 0.
+            if not math.isfinite(error):
+                error = 0.
+            graph.SetPoint(point, x, value)
+            graph.SetPointError(point, 0., error)
+            point += 1
+        if point:
+            graph.Draw("LP SAME")
+            legend_label = (f"{run} (N_{{total}} = {cohort_totals[run]:,})"
+                            if cohort_totals is not None else run)
+            legend.AddEntry(graph, legend_label, "lp")
+            objects.append(graph)
+            has_graph = True
+    if has_graph:
+        legend.Draw(); objects.append(legend)
+
+
+def make_plots(output, all_pads, joined, bins):
     objects = []
     overview = ROOT.TCanvas("overview", "BM2 SNR and timing", 1500, 1120)
     overview.Divide(2, 2)
     add_hist(overview.cd(1), "amplitude", "BM2 Step2 waveforms;maxA [ADC];Fraction / bin", all_pads, "maxA", 70, 0, 1750, objects)
-    add_hist(overview.cd(2), "noise", "BM2 matched single-pad timing cohort;Channel noise #sigma [ADC];Fraction / bin", joined, "peak_noise_rms", 50, 0, 25, objects)
+    add_snr_event_counts(overview.cd(2), bins, objects)
     add_hist(overview.cd(3), "snr", "BM2 matched single-pad timing cohort;SNR = maxA / peak_noise_rms;Fraction / bin", joined, "snr", 60, 0, 180, objects)
-    add_graph(overview.cd(4), "resolution_snr", "Same production variance estimator in each SNR bin;Median SNR;BM2 core resolution [ns]", bins, "snr_median", "bm2_sigma_ns", "bm2_sigma_error_ns", objects)
+    add_graph(overview.cd(4), "resolution_snr", "time resolution in each SNR bin;Median SNR;BM2 weighted-core resolution [ns]", bins, "snr_median", "bm2_sigma_ns", "bm2_sigma_error_ns", objects)
     overview.SaveAs(str(output / "snr_timing_comparison.png")); overview.SaveAs(str(output / "snr_timing_comparison.pdf"))
     mechanisms = ROOT.TCanvas("mechanisms", "SNR, shape, jitter and time walk", 1800, 600)
     mechanisms.Divide(3, 1)
-    add_graph(mechanisms.cd(1), "rise_snr", "Fitted rise duration;Median SNR;Median sigmoid t90-t10 [ns]", bins, "snr_median", "rise10_90_median_ns", None, objects)
-    add_graph(mechanisms.cd(2), "jitter_snr", "Noise / slope proxy (not total fitted-time error);Median SNR;Median #sigma_{noise} / slope_{20} [ns]", bins, "snr_median", "jitter20_proxy_median_ns", None, objects)
-    add_graph(mechanisms.cd(3), "walk_snr", "Amplitude-dependent mean shift;Median SNR;Core mean t_{BM2} - t_{Tracker2} [ns]", bins, "snr_median", "BM2_Tracker2_core_mu_ns", None, objects)
+    add_graph(mechanisms.cd(1), "rise_snr", "Fitted rise duration;Mean SNR;Mean sigmoid t90-t10 [ns]", bins, "snr_mean", "rise10_90_mean_ns", None, objects)
+    add_graph(mechanisms.cd(2), "jitter_snr", "Noise / slope proxy (not total fitted-time error);Mean SNR;Mean #sigma_{noise} / slope_{20} [ns]", bins, "snr_mean", "jitter20_proxy_mean_ns", None, objects)
+    add_graph(mechanisms.cd(3), "walk_snr", "Amplitude-dependent mean shift;Mean SNR;Core mean t_{BM2} - t_{Tracker2} [ns]", bins, "snr_mean", "BM2_Tracker2_core_mu_ns", None, objects, left_margin=.20, y_title_offset=1.35)
     mechanisms.SaveAs(str(output / "snr_timing_mechanisms.png")); mechanisms.SaveAs(str(output / "snr_timing_mechanisms.pdf"))
-    cuts = ROOT.TCanvas("cuts", "SNR threshold scan", 1500, 620)
-    cuts.Divide(2, 1)
-    add_graph(cuts.cd(1), "sigma_cut", "SNR threshold scan;Minimum SNR;BM2 core resolution [ns]", thresholds, "snr_min", "bm2_sigma_ns", "bm2_sigma_error_ns", objects)
-    add_graph(cuts.cd(2), "fraction_cut", "Fraction of original timing cohort retained;Minimum SNR;Retained fraction", thresholds, "snr_min", "retained_fraction", None, objects)
-    cuts.SaveAs(str(output / "snr_threshold_scan.png")); cuts.SaveAs(str(output / "snr_threshold_scan.pdf"))
+    bin_fractions = {run: len(records) for run, records in joined.items()}
+    binned = ROOT.TCanvas("snr_bins", "SNR-bin timing resolution", 1500, 620)
+    binned.Divide(2, 1)
+    add_interval_graph(
+        binned.cd(1), "sigma_by_snr_bin",
+        "BM2 resolution by SNR interval;SNR interval;BM2 core resolution [ns]",
+        bins, "bm2_sigma_ns", "bm2_sigma_error_ns", objects,
+        cohort_totals=bin_fractions,
+    )
+    add_interval_graph(
+        binned.cd(2), "fraction_by_snr_bin",
+        "Fraction of timing cohort in each SNR interval;SNR interval;Fraction in interval",
+        bins, "selected_events", None, objects, interval_fraction=bin_fractions,
+        cohort_totals=bin_fractions,
+    )
+    binned.SaveAs(str(output / "snr_threshold_scan.png")); binned.SaveAs(str(output / "snr_threshold_scan.pdf"))
     rf = ROOT.TFile(str(output / "snr_timing_plots.root"), "RECREATE")
-    for canvas in (overview, mechanisms, cuts):
+    for canvas in (overview, mechanisms, binned):
         canvas.Write()
     for obj in objects:
         if obj.InheritsFrom("TH1") or obj.InheritsFrom("TGraph"):
@@ -257,7 +408,22 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("runs", type=Path, nargs="+")
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument(
+        "--snr-bin-edges",
+        help="comma-separated finite edges, e.g. 15,25,40,60,90",
+    )
     args = parser.parse_args()
+    if args.snr_bin_edges:
+        try:
+            snr_edges = tuple(float(value) for value in args.snr_bin_edges.split(","))
+        except ValueError:
+            parser.error("--snr-bin-edges must be comma-separated numbers")
+        if (len(snr_edges) < 2 or any(not math.isfinite(value) for value in snr_edges)
+                or any(value < 0 for value in snr_edges)
+                or any(second <= first for first, second in zip(snr_edges, snr_edges[1:]))):
+            parser.error("--snr-bin-edges must contain at least two increasing non-negative values")
+    else:
+        snr_edges = BINS
     output = (args.output_dir or PROJECT / "debug/reports" / ("bm2_snr_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))).resolve()
     output.mkdir(parents=True, exist_ok=False)
     ROOT.gROOT.SetBatch(True); ROOT.gStyle.SetOptStat(0); ROOT.TH1.AddDirectory(False)
@@ -269,10 +435,17 @@ def main():
         all_pads[name] = pads; joined[name] = events
         full = timing_summary(events)
         stored = json.loads((run / "Combine/time_resolution/time_resolution.json").read_text())
-        expected = stored["solutions"]["mean"]["weighted_core"]["resolutions_ns"][stored["active_detectors"].index("BM2")]
-        if abs(full["bm2_sigma_ns"] - expected) > 1.e-8:
-            raise RuntimeError(f"{run}: diagnostic cohort does not reproduce production resolution")
-        summary = {"run": name, "step2_bm2_waveforms": len(pads), "track_events": total,
+        production_detectors = tuple(stored["active_detectors"])
+        production_match = "not_comparable_detector_set"
+        if production_detectors == ACTIVE:
+            expected = stored["solutions"]["mean"]["weighted_core"]["resolutions_ns"][production_detectors.index("BM2")]
+            if (not math.isfinite(full["bm2_sigma_ns"]) or not math.isfinite(expected)
+                    or abs(full["bm2_sigma_ns"] - expected) > 1.e-8):
+                raise RuntimeError(f"{run}: diagnostic cohort does not reproduce production resolution")
+            production_match = "verified"
+        summary = {"run": name, "production_resolution_comparison": production_match,
+                   "production_active_detectors": production_detectors,
+                   "step2_bm2_waveforms": len(pads), "track_events": total,
                    "availability": availability, "timing": full,
                    "common_four_detector_timing": timing_summary([r for r in events if r["all_four_valid"]]),
                    "step2_amplitude": describe([r["maxA"] for r in pads]),
@@ -283,7 +456,7 @@ def main():
                    "timing_rise10_90": describe([r["sigmoid_rise10_90_ns"] for r in events]),
                    "invalid_noise_events": sum(not math.isfinite(r["snr"]) for r in events),
                    "step2_high_amplitude_fraction_ge1400": sum(r["maxA"] >= 1400 for r in pads) / len(pads)}
-        summaries.append(summary); bins.extend(bin_rows(name, events))
+        summaries.append(summary); bins.extend(bin_rows(name, events, snr_edges))
         for cut in (0., 15., 25., 40., 60., 90.):
             selected = [r for r in events if math.isfinite(r["snr"]) and r["snr"] >= cut]
             row = {"run": name, "snr_min": cut, "retained_fraction": len(selected) / len(events)}
@@ -298,6 +471,8 @@ def main():
             for i, detector in enumerate(("BM1",) + ACTIVE):
                 record[detector + "_time_ns"] = row["mean"][i]
             event_rows.append(record)
+    if not event_rows:
+        raise RuntimeError("no BM2 single-matched-pad events with usable noise sigma for SNR analysis")
         print(name, json.dumps(clean(summary), ensure_ascii=False), flush=True)
     # Rows can have absent pair fields after an unsuccessful low-statistics fit.
     for rows in (bins, thresholds, bands):
@@ -307,17 +482,23 @@ def main():
                 row.setdefault(key, math.nan)
         if rows:
             rows[:] = [{key: row[key] for key in fields} for row in rows]
-    write_tsv(output / "snr_bins.tsv", bins)
+    if bins:
+        write_tsv(output / "snr_bins.tsv", bins)
+    else:
+        (output / "snr_bins.tsv").write_text(
+            "run\tsnr_low\tsnr_high\tselected_events\terror\n", encoding="utf-8"
+        )
     write_tsv(output / "snr_thresholds.tsv", thresholds)
     write_tsv(output / "snr_bands.tsv", bands)
     write_tsv(output / "matched_bm2_events.tsv", event_rows)
     report = {"runs": summaries, "snr_definition": "maxA/peak_noise_rms",
+              "snr_bin_edges": list(snr_edges),
               "cohort": "production TrackArrivalEvents, bmS_n[1]==1; exact 3x3 pad join; 25 ns/sample; pair-specific mean-t20 cohorts",
               "jitter_proxy": "25*k*noise/(0.16*H), local-crossing noise proxy, not fit covariance uncertainty",
               "uncertainty": "production weighted-core approximate pair-variance propagation; pair correlations and systematic errors not included",
               "bins": bins, "thresholds": thresholds, "bands": bands}
     (output / "snr_timing_report.json").write_text(json.dumps(clean(report), indent=2, ensure_ascii=False) + "\n")
-    make_plots(output, all_pads, joined, bins, thresholds)
+    make_plots(output, all_pads, joined, bins)
     print("Output:", output)
 
 

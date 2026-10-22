@@ -28,6 +28,8 @@ struct PadHit
   int position = -1;
   double charge = 0.0;
   double peak = 0.0;
+  double timingAmplitude = -1.0;
+  std::array<double, 4> timeSigmoid = {{-999.0, -999.0, -999.0, -999.0}};
 };
 
 struct TimeAccumulator
@@ -62,7 +64,7 @@ struct PadEvent
   TimeAccumulator arrivalT;
   TimeAccumulator arrivalTa;
   TimeAccumulator arrivalTe;
-  TimeAccumulator arrivalTSigmoid;
+  TimeAccumulator arrivalTSigmoid[4]; // t20, t30, t40, t50
 };
 
 // Track-matched timing geometry.
@@ -83,7 +85,7 @@ struct StripWave
   int channel = -1;
   double timeA = -999.0;
   double timeE = -999.0;
-  double timeS = -999.0;
+  std::array<double, 4> timeS = {{-999.0, -999.0, -999.0, -999.0}};
 };
 
 struct PadTimeKey
@@ -230,13 +232,20 @@ struct PadPlaneOutput
   Long64_t timestamp = -1;
   int nhits = 0;
   int nclusters = 0;
-  double timeMean[4] = {-999.0, -999.0, -999.0, -999.0};
-  double timeMin[4] = {-999.0, -999.0, -999.0, -999.0};
-  int timeCount[4] = {0, 0, 0, 0};
+  double timeMean[7] = {-999.0, -999.0, -999.0, -999.0,
+                        -999.0, -999.0, -999.0};
+  double timeMin[7] = {-999.0, -999.0, -999.0, -999.0,
+                       -999.0, -999.0, -999.0};
+  int timeCount[7] = {0, 0, 0, 0, 0, 0, 0};
   std::vector<int> hitPosition;
   std::vector<double> hitX, hitY, hitCharge, hitPeak;
   std::vector<int> clusterSize;
   std::vector<double> clusterX, clusterY, clusterCharge;
+  std::vector<int> hitClusterIndex;
+  std::array<std::vector<int>, 4> clusterTimeSigmoidN;
+  std::array<std::vector<double>, 4> hitTimeSigmoid;
+  std::array<std::vector<double>, 4> clusterTimeSigmoidMean;
+  std::array<std::vector<double>, 4> clusterTimeSigmoidMin;
   double primaryX = -1.0;
   double primaryY = -1.0;
   double primaryCharge = 0.0;
@@ -250,9 +259,10 @@ struct PadPlaneOutput
     scalar("timestamp", &timestamp, 'L');
     scalar("nhits", &nhits, 'I');
     scalar("nclusters", &nclusters, 'I');
-    const char *timeNames[4] = {"arrivalT", "arrivalT_a", "arrivalT_e",
-                                "arrivalT_sigmoid"};
-    for (int m = 0; m < 4; ++m)
+    const char *timeNames[7] = {"arrivalT", "arrivalT_a", "arrivalT_e",
+                                "arrivalT_sigmoid", "arrivalT_sigmoid30",
+                                "arrivalT_sigmoid40", "arrivalT_sigmoid50"};
+    for (int m = 0; m < 7; ++m)
     {
       scalar(Form("%s_mean", timeNames[m]), &timeMean[m], 'D');
       scalar(Form("%s_min", timeNames[m]), &timeMin[m], 'D');
@@ -270,6 +280,19 @@ struct PadPlaneOutput
     tree.Branch(prefix + "cluster_x", &clusterX);
     tree.Branch(prefix + "cluster_y", &clusterY);
     tree.Branch(prefix + "cluster_charge", &clusterCharge);
+    tree.Branch(prefix + "hit_cluster_index", &hitClusterIndex);
+    const char *fractionTags[4] = {"", "30", "40", "50"};
+    for (int f = 0; f < 4; ++f)
+    {
+      const TString tag = fractionTags[f];
+      tree.Branch(prefix + "hit_time_sigmoid" + tag, &hitTimeSigmoid[f]);
+      tree.Branch(prefix + "cluster_time_sigmoid" + tag + "_mean",
+                  &clusterTimeSigmoidMean[f]);
+      tree.Branch(prefix + "cluster_time_sigmoid" + tag + "_min",
+                  &clusterTimeSigmoidMin[f]);
+      tree.Branch(prefix + "cluster_time_sigmoid" + tag + "_n",
+                  &clusterTimeSigmoidN[f]);
+    }
     scalar("primary_x", &primaryX, 'D');
     scalar("primary_y", &primaryY, 'D');
     scalar("primary_charge", &primaryCharge, 'D');
@@ -280,9 +303,12 @@ struct PadPlaneOutput
     // Reset even when this plane has no hits in an otherwise valid event.
     *this = PadPlaneOutput{};
     timestamp = event.timestamp;
-    const TimeAccumulator *times[4] = {&event.arrivalT, &event.arrivalTa,
-                                       &event.arrivalTe, &event.arrivalTSigmoid};
-    for (int m = 0; m < 4; ++m)
+    const TimeAccumulator *times[7] = {&event.arrivalT, &event.arrivalTa,
+                                       &event.arrivalTe, &event.arrivalTSigmoid[0],
+                                       &event.arrivalTSigmoid[1],
+                                       &event.arrivalTSigmoid[2],
+                                       &event.arrivalTSigmoid[3]};
+    for (int m = 0; m < 7; ++m)
     {
       timeMean[m] = times[m]->Mean();
       timeMin[m] = times[m]->Minimum();
@@ -296,8 +322,11 @@ struct PadPlaneOutput
       hitY.push_back((hit.position / kPadGrid) * kPadPitch + kPadPitch / 2.0);
       hitCharge.push_back(hit.charge);
       hitPeak.push_back(hit.peak);
+      for (int f = 0; f < 4; ++f)
+        hitTimeSigmoid[f].push_back(hit.timeSigmoid[f]);
     }
     nhits = static_cast<int>(hitPosition.size());
+    hitClusterIndex.assign(nhits, -1);
     std::vector<bool> visited(hitPosition.size(), false);
     for (std::size_t seed = 0; seed < hitPosition.size(); ++seed)
     {
@@ -321,11 +350,15 @@ struct PadPlaneOutput
         }
       }
       double charge = 0.0, xCharge = 0.0, yCharge = 0.0;
+      TimeAccumulator clusterTime[4];
       for (std::size_t index : component)
       {
         charge += hitCharge[index];
         xCharge += hitCharge[index] * hitX[index];
         yCharge += hitCharge[index] * hitY[index];
+        hitClusterIndex[index] = static_cast<int>(clusterSize.size());
+        for (int f = 0; f < 4; ++f)
+          clusterTime[f].Add(hitTimeSigmoid[f][index]);
       }
       const double x = charge > 0.0 ? xCharge / charge : -1.0;
       const double y = charge > 0.0 ? yCharge / charge : -1.0;
@@ -333,6 +366,12 @@ struct PadPlaneOutput
       clusterX.push_back(x);
       clusterY.push_back(y);
       clusterCharge.push_back(charge);
+      for (int f = 0; f < 4; ++f)
+      {
+        clusterTimeSigmoidMean[f].push_back(clusterTime[f].Mean());
+        clusterTimeSigmoidMin[f].push_back(clusterTime[f].Minimum());
+        clusterTimeSigmoidN[f].push_back(clusterTime[f].count);
+      }
       if (charge > primaryCharge)
       {
         primaryCharge = charge;
@@ -447,7 +486,7 @@ bool ReconstructPadEvents(TString step2Name, TString step4Name,
   double arrivalT = -999.0;
   double arrivalTa = -999.0;
   double arrivalTe = -999.0;
-  double arrivalTSigmoid = -999.0;
+  double arrivalTSigmoid[4] = {-999.0, -999.0, -999.0, -999.0};
   Long64_t timestamp = -1;
   std::vector<short> *wave = nullptr;
   int rawChip = -1;
@@ -478,13 +517,19 @@ bool ReconstructPadEvents(TString step2Name, TString step4Name,
   else if (step2Tree->GetBranch("arrivalT_e"))
     step2Tree->SetBranchAddress("arrivalT_e", &arrivalTe);
   if (step2Tree->GetBranch("arrivetime_sigmoid"))
-    step2Tree->SetBranchAddress("arrivetime_sigmoid", &arrivalTSigmoid);
+    step2Tree->SetBranchAddress("arrivetime_sigmoid", &arrivalTSigmoid[0]);
   else if (step2Tree->GetBranch("arrivalT_sigmoid"))
-    step2Tree->SetBranchAddress("arrivalT_sigmoid", &arrivalTSigmoid);
+    step2Tree->SetBranchAddress("arrivalT_sigmoid", &arrivalTSigmoid[0]);
+  const char *sigmoidBranches[3] = {"arrivalT_sigmoid30",
+                                    "arrivalT_sigmoid40",
+                                    "arrivalT_sigmoid50"};
+  for (int f = 1; f < 4; ++f)
+    if (step2Tree->GetBranch(sigmoidBranches[f - 1]))
+      step2Tree->SetBranchAddress(sigmoidBranches[f - 1], &arrivalTSigmoid[f]);
 
-  // (event, chip, position) -> {maxA, a, e, s} for the track-matched BM
+  // (event, chip, position) -> {maxA, a, e, sigmoid t20/t30/t40/t50} for BM
   // timing. Keeps the entry with the largest maxA per pad.
-  std::map<PadTimeKey, std::array<double, 4>> padTimes;
+  std::map<PadTimeKey, std::array<double, 7>> padTimes;
 
 
   std::map<int, std::array<PadEvent, 2>> events;
@@ -492,7 +537,8 @@ bool ReconstructPadEvents(TString step2Name, TString step4Name,
     arrivalT = -999.0;
     arrivalTa = -999.0;
     arrivalTe = -999.0;
-    arrivalTSigmoid = -999.0;
+    for (double &time : arrivalTSigmoid)
+      time = -999.0;
   Long64_t selectedRecords = 0;
   Long64_t unmappedRecords = 0;
 
@@ -515,13 +561,16 @@ bool ReconstructPadEvents(TString step2Name, TString step4Name,
       key.event = event;
       key.chip = rawChip;
       key.position = position;
-      std::array<double, 4> &slot = padTimes[key];
+      std::array<double, 7> &slot = padTimes[key];
       if (maxA >= slot[0])
       {
         slot[0] = maxA;
         slot[1] = arrivalT > -900.0 ? arrivalT : -999.0;
         slot[2] = arrivalTe > -900.0 ? arrivalTe : -999.0;
-        slot[3] = arrivalTSigmoid > -900.0 ? arrivalTSigmoid : -999.0;
+        for (int f = 0; f < 4; ++f)
+          slot[3 + f] = arrivalTSigmoid[f] > -900.0
+                            ? arrivalTSigmoid[f]
+                            : -999.0;
       }
     }
 
@@ -548,10 +597,19 @@ bool ReconstructPadEvents(TString step2Name, TString step4Name,
       padEvent.timestamp = timestamp;
 
     PadHit &hit = padEvent.hits[position];
+    // Cluster timing counts each physical pad once. As in the legacy
+    // window timing, duplicate records use the largest-amplitude waveform.
+    if (maxA >= hit.timingAmplitude)
+    {
+      hit.timingAmplitude = maxA;
+      for (int f = 0; f < 4; ++f)
+        hit.timeSigmoid[f] = arrivalTSigmoid[f];
+    }
     padEvent.arrivalT.Add(arrivalT);
     padEvent.arrivalTa.Add(arrivalTa);
     padEvent.arrivalTe.Add(arrivalTe);
-    padEvent.arrivalTSigmoid.Add(arrivalTSigmoid);
+    for (int f = 0; f < 4; ++f)
+      padEvent.arrivalTSigmoid[f].Add(arrivalTSigmoid[f]);
     hit.position = position;
     hit.charge += charge;
     hit.peak = std::max(hit.peak, peak);
@@ -575,7 +633,7 @@ bool ReconstructPadEvents(TString step2Name, TString step4Name,
     int stripChannel = -1;
     double stripA = -999.0;
     double stripE = -999.0;
-    double stripS = -999.0;
+    double stripS[4] = {-999.0, -999.0, -999.0, -999.0};
     int pulseFitStatus = -1;
     int sigmoidFitStatus = -1;
     stripTree->SetBranchAddress("event", &stripEvent);
@@ -584,7 +642,10 @@ bool ReconstructPadEvents(TString step2Name, TString step4Name,
     if (stripTree->GetBranch("arrivalT_e"))
       stripTree->SetBranchAddress("arrivalT_e", &stripE);
     if (stripTree->GetBranch("arrivalT_sigmoid"))
-      stripTree->SetBranchAddress("arrivalT_sigmoid", &stripS);
+      stripTree->SetBranchAddress("arrivalT_sigmoid", &stripS[0]);
+    for (int f = 1; f < 4; ++f)
+      if (stripTree->GetBranch(sigmoidBranches[f - 1]))
+        stripTree->SetBranchAddress(sigmoidBranches[f - 1], &stripS[f]);
     stripTree->SetBranchAddress("pulseFitStatus", &pulseFitStatus);
     if (stripTree->GetBranch("sigmoidFitStatus"))
       stripTree->SetBranchAddress("sigmoidFitStatus", &sigmoidFitStatus);
@@ -605,9 +666,11 @@ bool ReconstructPadEvents(TString step2Name, TString step4Name,
         if (std::isfinite(stripE) && stripE > -900.0)
           w.timeE = stripE;
       }
-      if (sigmoidFitStatus == 0 && std::isfinite(stripS) &&
-          stripS > -900.0)
-        w.timeS = stripS;
+      if (sigmoidFitStatus == 0 && std::isfinite(stripS[0]) &&
+          stripS[0] > -900.0)
+        for (int f = 0; f < 4; ++f)
+          if (std::isfinite(stripS[f]) && stripS[f] > -900.0)
+            w.timeS[f] = stripS[f];
       strips[stripEvent].push_back(w);
     }
   }
@@ -631,6 +694,7 @@ bool ReconstructPadEvents(TString step2Name, TString step4Name,
   }
 
   Long64_t outputClusters[2] = {0, 0};
+  std::map<int, std::array<PadPlaneOutput, 2>> clusterEvents;
   for (const auto &eventItem : events)
   {
     for (int c = 0; c < 2; ++c)
@@ -639,6 +703,7 @@ bool ReconstructPadEvents(TString step2Name, TString step4Name,
         continue;
       outputEvent[c] = eventItem.first;
       planes[c].Set(eventItem.second[c]);
+      clusterEvents[eventItem.first][c] = planes[c];
       outputClusters[c] += planes[c].nclusters;
       padTrees[c]->Fill();
     }
@@ -671,22 +736,27 @@ bool ReconstructPadEvents(TString step2Name, TString step4Name,
       trackTree->SetBranchAddress("predStripY", trPredStripY);
 
     double bmA_mean[2], bmA_min[2], bmE_mean[2], bmE_min[2];
-    double bmS_mean[2], bmS_min[2];
-    int bmA_n[2], bmE_n[2], bmS_n[2];
+    double bmS_mean[4][2], bmS_min[4][2];
+    int bmA_n[2], bmE_n[2], bmS_n[4][2];
     double bm_pred_x[2], bm_pred_y[2];
     int bm_pred_ix[2], bm_pred_iy[2];
+    double bmClusterS_mean[4][2], bmClusterS_min[4][2];
+    int bmClusterS_n[4][2], bmMatchedClusterCount[2], bmMatchedClusterIndex[2];
+    int bmMatchedClusterSize[2];
+    double bmMatchedClusterDx[2], bmMatchedClusterDy[2];
     double trA_mean[MMdetN][2], trA_min[MMdetN][2];
     double trE_mean[MMdetN][2], trE_min[MMdetN][2];
-    double trS_mean[MMdetN][2], trS_min[MMdetN][2];
-    int trA_n[MMdetN][2], trE_n[MMdetN][2], trS_n[MMdetN][2];
+    double trS_mean[4][MMdetN][2], trS_min[4][MMdetN][2];
+    int trA_n[MMdetN][2], trE_n[MMdetN][2], trS_n[4][MMdetN][2];
     // Detector-level timing: pool every selected X/Y strip once. In
     // particular physical Tracker2 is index 1, NOT the all-layer ev* time.
-    double trXY_mean[3][MMdetN], trXY_min[3][MMdetN];
-    int trXY_n[3][MMdetN];
+    double trXY_mean[6][MMdetN], trXY_min[6][MMdetN];
+    int trXY_n[6][MMdetN];
     double evA_mean = -999.0, evA_min = -999.0;
     double evE_mean = -999.0, evE_min = -999.0;
-    double evS_mean = -999.0, evS_min = -999.0;
-    int evA_n = 0, evE_n = 0, evS_n = 0;
+    double evS_mean[4] = {-999.0, -999.0, -999.0, -999.0};
+    double evS_min[4] = {-999.0, -999.0, -999.0, -999.0};
+    int evA_n = 0, evE_n = 0, evS_n[4] = {0, 0, 0, 0};
 
     trackTimeTree.Branch("event", &trEvent, "event/I");
     trackTimeTree.Branch("timestamp", &trTimestamp, "timestamp/L");
@@ -696,13 +766,38 @@ bool ReconstructPadEvents(TString step2Name, TString step4Name,
     trackTimeTree.Branch("bmE_mean", bmE_mean, "bmE_mean[2]/D");
     trackTimeTree.Branch("bmE_min", bmE_min, "bmE_min[2]/D");
     trackTimeTree.Branch("bmE_n", bmE_n, "bmE_n[2]/I");
-    trackTimeTree.Branch("bmS_mean", bmS_mean, "bmS_mean[2]/D");
-    trackTimeTree.Branch("bmS_min", bmS_min, "bmS_min[2]/D");
-    trackTimeTree.Branch("bmS_n", bmS_n, "bmS_n[2]/I");
+    const char *fractionTags[4] = {"", "30", "40", "50"};
+    for (int f = 0; f < 4; ++f)
+    {
+      const TString bmName = Form("bmS%s", fractionTags[f]);
+      trackTimeTree.Branch(bmName + "_mean", bmS_mean[f],
+                           Form("%s_mean[2]/D", bmName.Data()));
+      trackTimeTree.Branch(bmName + "_min", bmS_min[f],
+                           Form("%s_min[2]/D", bmName.Data()));
+      trackTimeTree.Branch(bmName + "_n", bmS_n[f],
+                           Form("%s_n[2]/I", bmName.Data()));
+      const TString clusterName = Form("bmClusterS%s", fractionTags[f]);
+      trackTimeTree.Branch(clusterName + "_mean", bmClusterS_mean[f],
+                           Form("%s_mean[2]/D", clusterName.Data()));
+      trackTimeTree.Branch(clusterName + "_min", bmClusterS_min[f],
+                           Form("%s_min[2]/D", clusterName.Data()));
+      trackTimeTree.Branch(clusterName + "_n", bmClusterS_n[f],
+                           Form("%s_n[2]/I", clusterName.Data()));
+    }
     trackTimeTree.Branch("bm_pred_x", bm_pred_x, "bm_pred_x[2]/D");
     trackTimeTree.Branch("bm_pred_y", bm_pred_y, "bm_pred_y[2]/D");
     trackTimeTree.Branch("bm_pred_ix", bm_pred_ix, "bm_pred_ix[2]/I");
     trackTimeTree.Branch("bm_pred_iy", bm_pred_iy, "bm_pred_iy[2]/I");
+    trackTimeTree.Branch("bm_matched_cluster_count", bmMatchedClusterCount,
+                        "bm_matched_cluster_count[2]/I");
+    trackTimeTree.Branch("bm_matched_cluster_index", bmMatchedClusterIndex,
+                        "bm_matched_cluster_index[2]/I");
+    trackTimeTree.Branch("bm_matched_cluster_size", bmMatchedClusterSize,
+                        "bm_matched_cluster_size[2]/I");
+    trackTimeTree.Branch("bm_matched_cluster_dx", bmMatchedClusterDx,
+                        "bm_matched_cluster_dx[2]/D");
+    trackTimeTree.Branch("bm_matched_cluster_dy", bmMatchedClusterDy,
+                        "bm_matched_cluster_dy[2]/D");
     trackTimeTree.Branch("trA_mean", trA_mean,
                          Form("trA_mean[%d][2]/D", MMdetN));
     trackTimeTree.Branch("trA_min", trA_min,
@@ -713,13 +808,18 @@ bool ReconstructPadEvents(TString step2Name, TString step4Name,
     trackTimeTree.Branch("trE_min", trE_min,
                          Form("trE_min[%d][2]/D", MMdetN));
     trackTimeTree.Branch("trE_n", trE_n, Form("trE_n[%d][2]/I", MMdetN));
-    trackTimeTree.Branch("trS_mean", trS_mean,
-                         Form("trS_mean[%d][2]/D", MMdetN));
-    trackTimeTree.Branch("trS_min", trS_min,
-                         Form("trS_min[%d][2]/D", MMdetN));
-    trackTimeTree.Branch("trS_n", trS_n, Form("trS_n[%d][2]/I", MMdetN));
-    const char *timeTags[3] = {"A", "E", "S"};
-    for (int m = 0; m < 3; ++m)
+    for (int f = 0; f < 4; ++f)
+    {
+      const TString trName = Form("trS%s", fractionTags[f]);
+      trackTimeTree.Branch(trName + "_mean", trS_mean[f],
+                           Form("%s_mean[%d][2]/D", trName.Data(), MMdetN));
+      trackTimeTree.Branch(trName + "_min", trS_min[f],
+                           Form("%s_min[%d][2]/D", trName.Data(), MMdetN));
+      trackTimeTree.Branch(trName + "_n", trS_n[f],
+                           Form("%s_n[%d][2]/I", trName.Data(), MMdetN));
+    }
+    const char *timeTags[6] = {"A", "E", "S", "S30", "S40", "S50"};
+    for (int m = 0; m < 6; ++m)
     {
       TString name = Form("trXY%s_mean", timeTags[m]);
       trackTimeTree.Branch(name, trXY_mean[m], Form("%s[%d]/D", name.Data(), MMdetN));
@@ -734,9 +834,16 @@ bool ReconstructPadEvents(TString step2Name, TString step4Name,
     trackTimeTree.Branch("evE_mean", &evE_mean, "evE_mean/D");
     trackTimeTree.Branch("evE_min", &evE_min, "evE_min/D");
     trackTimeTree.Branch("evE_n", &evE_n, "evE_n/I");
-    trackTimeTree.Branch("evS_mean", &evS_mean, "evS_mean/D");
-    trackTimeTree.Branch("evS_min", &evS_min, "evS_min/D");
-    trackTimeTree.Branch("evS_n", &evS_n, "evS_n/I");
+    for (int f = 0; f < 4; ++f)
+    {
+      const TString evName = Form("evS%s", fractionTags[f]);
+      trackTimeTree.Branch(evName + "_mean", &evS_mean[f],
+                           Form("%s_mean/D", evName.Data()));
+      trackTimeTree.Branch(evName + "_min", &evS_min[f],
+                           Form("%s_min/D", evName.Data()));
+      trackTimeTree.Branch(evName + "_n", &evS_n[f],
+                           Form("%s_n/I", evName.Data()));
+    }
 
     Long64_t trackTimeEvents = 0;
     const Long64_t nTrackEntries = trackTree->GetEntries();
@@ -746,13 +853,21 @@ bool ReconstructPadEvents(TString step2Name, TString step4Name,
       if (!trUseflag)
         continue;
 
-      TimeAccumulator bmAcc[2][3];
-      TimeAccumulator trAcc[MMdetN][2][3];
-      TimeAccumulator trXYAcc[MMdetN][3];
-      TimeAccumulator evAcc[3];
+      TimeAccumulator bmAcc[2][6];
+      TimeAccumulator trAcc[MMdetN][2][6];
+      TimeAccumulator trXYAcc[MMdetN][6];
+      TimeAccumulator evAcc[6];
 
       for (int c = 0; c < 2; ++c)
       {
+        for (int f = 0; f < 4; ++f)
+        {
+          bmClusterS_mean[f][c] = bmClusterS_min[f][c] = -999.0;
+          bmClusterS_n[f][c] = 0;
+        }
+        bmMatchedClusterCount[c] = bmMatchedClusterSize[c] = 0;
+        bmMatchedClusterIndex[c] = -1;
+        bmMatchedClusterDx[c] = bmMatchedClusterDy[c] = -999.0;
         const double xPred = trXfit[0] * kBMZ[c] + trXfit[1] +
                              bmAlignDx[c];
         const double yPred = trYfit[0] * kBMZ[c] + trYfit[1] +
@@ -769,6 +884,39 @@ bool ReconstructPadEvents(TString step2Name, TString step4Name,
         bm_pred_iy[c] = iy;
         if (ix < 0 || ix >= kPadGrid || iy < 0 || iy >= kPadGrid)
           continue;
+        // Associate clusters using the same spatial window as the legacy
+        // pad mode. Count spatial candidates before testing timing validity,
+        // so a failed time fit cannot hide an ambiguous cluster association.
+        const auto clusterEvent = clusterEvents.find(trEvent);
+        if (clusterEvent != clusterEvents.end())
+        {
+          const PadPlaneOutput &plane = clusterEvent->second[c];
+          std::set<int> matches;
+          for (std::size_t h = 0; h < plane.hitPosition.size(); ++h)
+          {
+            const int position = plane.hitPosition[h];
+            if (std::abs(position % kPadGrid - ix) <= 1 &&
+                std::abs(position / kPadGrid - iy) <= 1)
+              matches.insert(plane.hitClusterIndex[h]);
+          }
+          bmMatchedClusterCount[c] = static_cast<int>(matches.size());
+          if (matches.size() == 1)
+          {
+            const int cluster = *matches.begin();
+            bmMatchedClusterIndex[c] = cluster;
+            bmMatchedClusterSize[c] = plane.clusterSize[cluster];
+            bmMatchedClusterDx[c] = plane.clusterX[cluster] - xLocal;
+            bmMatchedClusterDy[c] = plane.clusterY[cluster] - yLocal;
+            // Use the complete matched cluster, including members outside
+            // the matching window; other clusters never enter this time.
+            for (int f = 0; f < 4; ++f)
+            {
+              bmClusterS_mean[f][c] = plane.clusterTimeSigmoidMean[f][cluster];
+              bmClusterS_min[f][c] = plane.clusterTimeSigmoidMin[f][cluster];
+              bmClusterS_n[f][c] = plane.clusterTimeSigmoidN[f][cluster];
+            }
+          }
+        }
         for (int di = -1; di <= 1; ++di)
         {
           for (int dj = -1; dj <= 1; ++dj)
@@ -781,14 +929,15 @@ bool ReconstructPadEvents(TString step2Name, TString step4Name,
             key.event = trEvent;
             key.chip = kBMChip[c];
             key.position = nx + kPadGrid * ny;
-            std::map<PadTimeKey, std::array<double, 4>>::const_iterator it =
+            std::map<PadTimeKey, std::array<double, 7>>::const_iterator it =
                 padTimes.find(key);
             if (it == padTimes.end())
               continue;
-            const std::array<double, 4> &slot = it->second;
+            const std::array<double, 7> &slot = it->second;
             bmAcc[c][0].Add(slot[1]);
             bmAcc[c][1].Add(slot[2]);
-            bmAcc[c][2].Add(slot[3]);
+            for (int f = 0; f < 4; ++f)
+              bmAcc[c][2 + f].Add(slot[3 + f]);
           }
         }
       }
@@ -826,13 +975,16 @@ bool ReconstructPadEvents(TString step2Name, TString step4Name,
               {
                 trAcc[j][d][0].Add(w.timeA);
                 trAcc[j][d][1].Add(w.timeE);
-                trAcc[j][d][2].Add(w.timeS);
                 trXYAcc[j][0].Add(w.timeA);
                 trXYAcc[j][1].Add(w.timeE);
-                trXYAcc[j][2].Add(w.timeS);
                 evAcc[0].Add(w.timeA);
                 evAcc[1].Add(w.timeE);
-                evAcc[2].Add(w.timeS);
+                for (int f = 0; f < 4; ++f)
+                {
+                  trAcc[j][d][2 + f].Add(w.timeS[f]);
+                  trXYAcc[j][2 + f].Add(w.timeS[f]);
+                  evAcc[2 + f].Add(w.timeS[f]);
+                }
               }
             }
             current.clear();
@@ -856,9 +1008,12 @@ bool ReconstructPadEvents(TString step2Name, TString step4Name,
         bmE_mean[c] = bmAcc[c][1].Mean();
         bmE_min[c] = bmAcc[c][1].Minimum();
         bmE_n[c] = bmAcc[c][1].count;
-        bmS_mean[c] = bmAcc[c][2].Mean();
-        bmS_min[c] = bmAcc[c][2].Minimum();
-        bmS_n[c] = bmAcc[c][2].count;
+        for (int f = 0; f < 4; ++f)
+        {
+          bmS_mean[f][c] = bmAcc[c][2 + f].Mean();
+          bmS_min[f][c] = bmAcc[c][2 + f].Minimum();
+          bmS_n[f][c] = bmAcc[c][2 + f].count;
+        }
       }
       for (int j = 0; j < MMdetN; ++j)
       {
@@ -870,13 +1025,16 @@ bool ReconstructPadEvents(TString step2Name, TString step4Name,
           trE_mean[j][d] = trAcc[j][d][1].Mean();
           trE_min[j][d] = trAcc[j][d][1].Minimum();
           trE_n[j][d] = trAcc[j][d][1].count;
-          trS_mean[j][d] = trAcc[j][d][2].Mean();
-          trS_min[j][d] = trAcc[j][d][2].Minimum();
-          trS_n[j][d] = trAcc[j][d][2].count;
+          for (int f = 0; f < 4; ++f)
+          {
+            trS_mean[f][j][d] = trAcc[j][d][2 + f].Mean();
+            trS_min[f][j][d] = trAcc[j][d][2 + f].Minimum();
+            trS_n[f][j][d] = trAcc[j][d][2 + f].count;
+          }
         }
       }
       evA_mean = evAcc[0].Mean();
-      for (int m = 0; m < 3; ++m)
+      for (int m = 0; m < 6; ++m)
         for (int j = 0; j < MMdetN; ++j)
         {
           trXY_mean[m][j] = trXYAcc[j][m].Mean();
@@ -888,9 +1046,12 @@ bool ReconstructPadEvents(TString step2Name, TString step4Name,
       evE_mean = evAcc[1].Mean();
       evE_min = evAcc[1].Minimum();
       evE_n = evAcc[1].count;
-      evS_mean = evAcc[2].Mean();
-      evS_min = evAcc[2].Minimum();
-      evS_n = evAcc[2].count;
+      for (int f = 0; f < 4; ++f)
+      {
+        evS_mean[f] = evAcc[2 + f].Mean();
+        evS_min[f] = evAcc[2 + f].Minimum();
+        evS_n[f] = evAcc[2 + f].count;
+      }
 
       trackTimeTree.Fill();
       ++trackTimeEvents;
